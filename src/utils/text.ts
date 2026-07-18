@@ -42,7 +42,7 @@ export function tokenize(value: string): string[] {
     .filter((token) => token.length > 1);
 }
 
-export function cosineSimilarity(left: number[], right: number[]): number {
+export function cosineSimilarity(left: ArrayLike<number>, right: ArrayLike<number>): number {
   const length = Math.min(left.length, right.length);
   if (length === 0) return 0;
   let dot = 0;

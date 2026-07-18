@@ -74,4 +74,25 @@ describe("GeminiClient authentication", () => {
       }]
     });
   });
+
+  it("batches embedding requests and preserves vector order", async () => {
+    let requestBody: { requests?: unknown[] } | undefined;
+    const transport = vi.fn(async (url: string, init: RequestInit) => {
+      expect(url).toContain(":batchEmbedContents");
+      requestBody = JSON.parse(String(init.body)) as { requests?: unknown[] };
+      return new Response(JSON.stringify({
+        embeddings: [
+          { values: [1, 0, 0] },
+          { values: [0, 1, 0] }
+        ]
+      }), { status: 200, headers: { "Content-Type": "application/json" } });
+    });
+    const client = new GeminiClient(
+      () => ({ ...DEFAULT_SETTINGS, apiKey: "AQ.batch-test-key", embeddingDimensions: 3 }),
+      transport
+    );
+
+    await expect(client.embedBatch(["first", "second"])).resolves.toEqual([[1, 0, 0], [0, 1, 0]]);
+    expect(requestBody?.requests).toHaveLength(2);
+  });
 });

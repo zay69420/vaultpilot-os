@@ -1,6 +1,6 @@
 import { App, TFile } from "obsidian";
 import { assertSafeFolder, joinSafeVaultPath } from "../security/pathGuard";
-import type { GeminiContent, TokenUsage, VaultPilotSettings } from "../types";
+import type { GeminiContent, MemoryEntry, TokenUsage, VaultPilotSettings } from "../types";
 import { lexicalScore } from "../utils/text";
 import { ensureFolder } from "../utils/vault";
 import { GeminiClient } from "./geminiClient";
@@ -73,7 +73,7 @@ Do not store greetings, transient requests, current searches, names of notes the
       const content = sanitizeMemoryContent(update.content ?? "");
       const confidence = Number(update.confidence ?? 0);
       if (!category || !key || !content || confidence < settings.memoryThreshold || looksSensitive(content) || looksTransient(key, content)) continue;
-      await this.upsert(category, key, content);
+      await this.upsert(category, key, content, confidence, "conversation");
       written += 1;
     }
     return written;
@@ -83,31 +83,61 @@ Do not store greetings, transient requests, current searches, names of notes the
     const settings = this.getSettings();
     if (!settings.memoryEnabled) return "";
     const folder = assertSafeFolder(settings.memoryFolder);
-    const candidates: Array<{ path: string; content: string; score: number }> = [];
-    for (const filename of Object.values(MEMORY_FILES)) {
+    const candidates: Array<{ entry: MemoryEntry; score: number }> = [];
+    for (const [category, filename] of Object.entries(MEMORY_FILES) as Array<[MemoryCategory, string]>) {
       const path = joinSafeVaultPath(folder, filename);
       const file = this.app.vault.getAbstractFileByPath(path);
       if (!(file instanceof TFile)) continue;
       const content = await this.app.vault.cachedRead(file);
-      const score = lexicalScore(query, `${filename} ${content}`);
-      candidates.push({ path, content, score });
+      for (const entry of parseEntries(category, content)) {
+        candidates.push({ entry, score: lexicalScore(query, `${filename} ${entry.key} ${entry.content}`) });
+      }
     }
     const selected = candidates
       .sort((left, right) => right.score - left.score)
-      .filter((item, index) => item.score > 0 || index < 2)
-      .slice(0, 3);
-    let remaining = 10_000;
-    const sections: string[] = [];
+      .filter((item, index) => item.score > 0 || index < 4)
+      .slice(0, 16);
+    let remaining = 8_000;
+    const lines: string[] = [];
     for (const item of selected) {
-      const content = item.content.slice(0, remaining);
-      if (!content) break;
-      sections.push(`## ${item.path}\n${content}`);
-      remaining -= content.length;
+      const line = `- [${item.entry.category}/${item.entry.key}] ${item.entry.content} (confidence ${item.entry.confidence.toFixed(2)}, updated ${item.entry.updatedAt})`;
+      if (line.length > remaining) break;
+      lines.push(line);
+      remaining -= line.length;
     }
-    return sections.join("\n\n");
+    return lines.join("\n");
   }
 
-  private async upsert(category: MemoryCategory, key: string, content: string): Promise<void> {
+  async listEntries(): Promise<MemoryEntry[]> {
+    const settings = this.getSettings();
+    if (!settings.memoryEnabled) return [];
+    const folder = assertSafeFolder(settings.memoryFolder);
+    const entries: MemoryEntry[] = [];
+    for (const [category, filename] of Object.entries(MEMORY_FILES) as Array<[MemoryCategory, string]>) {
+      const file = this.app.vault.getAbstractFileByPath(joinSafeVaultPath(folder, filename));
+      if (file instanceof TFile) entries.push(...parseEntries(category, await this.app.vault.cachedRead(file)));
+    }
+    return entries.sort((left, right) => right.updatedAt.localeCompare(left.updatedAt));
+  }
+
+  async forget(category: MemoryCategory, key: string): Promise<boolean> {
+    const folder = assertSafeFolder(this.getSettings().memoryFolder);
+    const path = joinSafeVaultPath(folder, MEMORY_FILES[category]);
+    const file = this.app.vault.getAbstractFileByPath(path);
+    if (!(file instanceof TFile)) return false;
+    let removed = false;
+    await this.app.vault.process(file, (current) => {
+      const lines = current.split("\n").filter((line) => {
+        const matches = entryKey(line) === key;
+        if (matches) removed = true;
+        return !matches;
+      });
+      return `${lines.join("\n").trimEnd()}\n`;
+    });
+    return removed;
+  }
+
+  private async upsert(category: MemoryCategory, key: string, content: string, confidence: number, source: string): Promise<void> {
     const settings = this.getSettings();
     const folder = assertSafeFolder(settings.memoryFolder);
     await ensureFolder(this.app, folder);
@@ -115,17 +145,72 @@ Do not store greetings, transient requests, current searches, names of notes the
     let file = this.app.vault.getAbstractFileByPath(path);
     if (!file) file = await this.app.vault.create(path, `# ${titleFromCategory(category)}\n\n`);
     if (!(file instanceof TFile)) throw new Error(`Memory path is not a file: ${path}`);
-    const marker = `<!-- vaultpilot:key=${key} -->`;
     const date = new Date().toISOString().slice(0, 10);
-    const line = `- ${content} _(updated ${date})_ ${marker}`;
     await this.app.vault.process(file, (current) => {
       const lines = current.split("\n");
-      const existing = lines.findIndex((candidate) => candidate.includes(marker));
+      const existing = lines.findIndex((candidate) => entryKey(candidate) === key);
+      const previous = existing >= 0 ? parseEntry(category, lines[existing] ?? "") : null;
+      const metadata = JSON.stringify({
+        key,
+        confidence: Math.max(0, Math.min(1, confidence)),
+        createdAt: previous?.createdAt ?? date,
+        updatedAt: date,
+        source
+      });
+      const line = `- ${content} <!-- vaultpilot:${metadata} -->`;
       if (existing >= 0) lines[existing] = line;
       else lines.push(line);
       return `${lines.join("\n").trimEnd()}\n`;
     });
   }
+}
+
+function parseEntries(category: MemoryCategory, content: string): MemoryEntry[] {
+  return content.split("\n").map((line) => parseEntry(category, line)).filter((entry): entry is MemoryEntry => Boolean(entry));
+}
+
+function parseEntry(category: MemoryCategory, line: string): MemoryEntry | null {
+  const modern = line.match(/^\s*-\s+(.+?)\s+<!--\s*vaultpilot:(\{.*\})\s*-->\s*$/);
+  if (modern) {
+    try {
+      const metadata = JSON.parse(modern[2] ?? "{}") as Partial<MemoryEntry> & { key?: string };
+      const key = sanitizeKey(metadata.key ?? "");
+      const content = sanitizeMemoryContent(modern[1] ?? "");
+      if (!key || !content) return null;
+      return {
+        category,
+        key,
+        content,
+        confidence: Math.max(0, Math.min(1, Number(metadata.confidence ?? 0.8))),
+        createdAt: String(metadata.createdAt ?? metadata.updatedAt ?? "unknown"),
+        updatedAt: String(metadata.updatedAt ?? metadata.createdAt ?? "unknown"),
+        source: String(metadata.source ?? "conversation").slice(0, 80)
+      };
+    } catch {
+      return null;
+    }
+  }
+  const legacy = line.match(/^\s*-\s+(.+?)(?:\s+_\(updated\s+(\d{4}-\d{2}-\d{2})\)_)?\s+<!--\s*vaultpilot:key=([^\s>]+)\s*-->\s*$/);
+  if (!legacy) return null;
+  const content = sanitizeMemoryContent(legacy[1] ?? "");
+  const key = sanitizeKey(legacy[3] ?? "");
+  if (!key || !content) return null;
+  const date = legacy[2] ?? "unknown";
+  return { category, key, content, confidence: 0.8, createdAt: date, updatedAt: date, source: "legacy" };
+}
+
+function entryKey(line: string): string | null {
+  const modern = line.match(/<!--\s*vaultpilot:(\{.*\})\s*-->/);
+  if (modern) {
+    try {
+      const value = JSON.parse(modern[1] ?? "{}") as { key?: string };
+      return sanitizeKey(value.key ?? "") || null;
+    } catch {
+      return null;
+    }
+  }
+  const legacy = line.match(/<!--\s*vaultpilot:key=([^\s>]+)\s*-->/);
+  return legacy ? sanitizeKey(legacy[1] ?? "") || null : null;
 }
 
 function asCategory(value: string | undefined): MemoryCategory | null {

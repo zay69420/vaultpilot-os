@@ -1,5 +1,5 @@
 import { Notice, Platform, Plugin, PluginSettingTab, SecretComponent, Setting } from "obsidian";
-import type { CustomCommand, VaultPilotSettings } from "../types";
+import type { CustomCommand, IntegrationStatus, MemoryEntry, ToolAuditEntry, ToolPolicy, VaultPilotSettings } from "../types";
 import { createId } from "../utils/id";
 
 export interface SettingsHost {
@@ -7,6 +7,12 @@ export interface SettingsHost {
   updateSettings(patch: Partial<VaultPilotSettings>): Promise<void>;
   testGeminiConnection(): Promise<string>;
   rebuildSearchIndex(): Promise<void>;
+  getIntegrationStatuses(): IntegrationStatus[];
+  getToolAuditEntries(): ToolAuditEntry[];
+  getMemoryEntries(): Promise<MemoryEntry[]>;
+  forgetMemory(category: MemoryEntry["category"], key: string): Promise<boolean>;
+  clearToolAudit(): void;
+  undoLatestToolChange(): Promise<string>;
 }
 
 export class VaultPilotSettingTab extends PluginSettingTab {
@@ -64,12 +70,25 @@ export class VaultPilotSettingTab extends PluginSettingTab {
     new Setting(containerEl).setName("Agent behavior").setHeading();
     new Setting(containerEl)
       .setName("Tool execution")
-      .setDesc("Automatic runs tools immediately. Manual shows an inline Allow/Deny card before every tool call.")
+      .setDesc("Quick preset. Fine-grained policies below control each action category.")
       .addDropdown((dropdown) => dropdown
         .addOption("automatic", "Automatic execution")
         .addOption("manual", "Manual approval")
         .setValue(settings.executionMode)
-        .onChange(async (value) => this.host.updateSettings({ executionMode: value as "automatic" | "manual" })));
+        .onChange(async (value) => {
+          const executionMode = value as "automatic" | "manual";
+          await this.host.updateSettings({
+            executionMode,
+            toolPolicies: executionMode === "manual"
+              ? { read: "manual", network: "manual", write: "manual", sync: "manual" }
+              : { read: "automatic", network: "manual", write: "manual", sync: "manual" }
+          });
+          this.display();
+        }));
+    policySetting(containerEl, "Vault reads and searches", "Read-only actions can usually run safely in the background.", settings.toolPolicies.read, (read) => this.host.updateSettings({ toolPolicies: { ...this.host.getSettings().toolPolicies, read } }));
+    policySetting(containerEl, "Public web requests", "Controls DuckDuckGo searches and other public network requests.", settings.toolPolicies.network, (network) => this.host.updateSettings({ toolPolicies: { ...this.host.getSettings().toolPolicies, network } }));
+    policySetting(containerEl, "Vault and task changes", "Shows an exact preview when approval is required. Successful changes are logged and undoable.", settings.toolPolicies.write, (write) => this.host.updateSettings({ toolPolicies: { ...this.host.getSettings().toolPolicies, write } }));
+    policySetting(containerEl, "Sync actions", "Sync always asks for confirmation, even if Automatic is selected.", settings.toolPolicies.sync, (sync) => this.host.updateSettings({ toolPolicies: { ...this.host.getSettings().toolPolicies, sync } }), false);
     numberSetting(containerEl, "Maximum agent steps", "Stops runaway tool loops, then asks Gemini for a final answer.", settings.maxAgentSteps, 1, 20, 1, (maxAgentSteps) => this.host.updateSettings({ maxAgentSteps }));
     numberSetting(containerEl, "Maximum output tokens", "Upper output-token budget per Gemini turn.", settings.maxOutputTokens, 256, 65536, 256, (maxOutputTokens) => this.host.updateSettings({ maxOutputTokens }));
     numberSetting(containerEl, "Temperature", "Lower values are more deterministic.", settings.temperature, 0, 2, 0.1, (temperature) => this.host.updateSettings({ temperature }));
@@ -108,6 +127,12 @@ export class VaultPilotSettingTab extends PluginSettingTab {
     numberSetting(containerEl, "Chunk size", "Approximate characters per Markdown chunk.", settings.chunkSize, 500, 12000, 100, (chunkSize) => this.host.updateSettings({ chunkSize }));
     numberSetting(containerEl, "Chunk overlap", "Characters repeated across adjacent chunks.", settings.chunkOverlap, 0, Math.max(0, settings.chunkSize - 1), 20, (chunkOverlap) => this.host.updateSettings({ chunkOverlap }));
     numberSetting(containerEl, "Maximum chunks per file", "Caps indexing work for unusually large notes.", settings.maxChunksPerFile, 1, 1000, 1, (maxChunksPerFile) => this.host.updateSettings({ maxChunksPerFile }));
+    numberSetting(containerEl, "Embedding batch size", "Sends multiple chunks per embedding request for faster, cheaper indexing. Falls back safely if batching is unavailable.", settings.embeddingBatchSize, 1, 100, 1, (embeddingBatchSize) => this.host.updateSettings({ embeddingBatchSize }));
+    numberSetting(containerEl, "Search result cache", "Number of recent searches kept in memory. Set to 0 to disable.", settings.searchCacheSize, 0, 200, 5, (searchCacheSize) => this.host.updateSettings({ searchCacheSize }));
+    new Setting(containerEl)
+      .setName("Allow indexing on mobile")
+      .setDesc("Turn off to search the existing index without background embedding work on phones or tablets.")
+      .addToggle((toggle) => toggle.setValue(settings.mobileIndexingEnabled).onChange(async (mobileIndexingEnabled) => this.host.updateSettings({ mobileIndexingEnabled })));
     numberSetting(containerEl, "Semantic weight", "Relative contribution from embedding similarity.", settings.semanticWeight, 0, 1, 0.05, (semanticWeight) => this.host.updateSettings({ semanticWeight }));
     numberSetting(containerEl, "Lexical weight", "Relative contribution from exact terms and phrase matches.", settings.lexicalWeight, 0, 1, 0.05, (lexicalWeight) => this.host.updateSettings({ lexicalWeight }));
     numberSetting(containerEl, "Graph weight", "Relative first-degree linked-note and backlink boost.", settings.graphWeight, 0, 1, 0.05, (graphWeight) => this.host.updateSettings({ graphWeight }));
@@ -137,9 +162,56 @@ export class VaultPilotSettingTab extends PluginSettingTab {
       .setName("Proactive memory intercept")
       .setDesc("Before the main response, a lightweight Gemini pass extracts durable facts and updates memory when warranted.")
       .addToggle((toggle) => toggle.setValue(settings.memoryInterceptEnabled).onChange(async (memoryInterceptEnabled) => this.host.updateSettings({ memoryInterceptEnabled })));
+    new Setting(containerEl)
+      .setName("Memory update timing")
+      .setDesc("Background keeps chat responsive. Blocking finishes durable-memory review before answering.")
+      .addDropdown((dropdown) => dropdown
+        .addOption("background", "Background")
+        .addOption("blocking", "Blocking")
+        .setValue(settings.memoryInterceptMode)
+        .onChange(async (memoryInterceptMode) => this.host.updateSettings({ memoryInterceptMode: memoryInterceptMode as "background" | "blocking" })));
     textSetting(containerEl, "Memory model", "Lower-cost model used only for structured memory extraction.", settings.memoryModel, (memoryModel) => this.host.updateSettings({ memoryModel }));
     numberSetting(containerEl, "Memory confidence threshold", "Only writes model-extracted facts at or above this score.", settings.memoryThreshold, 0, 1, 0.01, (memoryThreshold) => this.host.updateSettings({ memoryThreshold }));
     numberSetting(containerEl, "Recent conversation buffer", "Number of previous conversations added to short-term context.", settings.conversationHistoryLimit, 0, 20, 1, (conversationHistoryLimit) => this.host.updateSettings({ conversationHistoryLimit }));
+
+    const memoryManager = containerEl.createDiv({ cls: "vaultpilot-memory-manager" });
+    memoryManager.createEl("p", { cls: "setting-item-description", text: "Memory entries include their source, confidence, and update date. You can remove individual entries here." });
+    void this.renderMemoryManager(memoryManager);
+
+    new Setting(containerEl).setName("Productivity bridge").setHeading();
+    textSetting(containerEl, "Dashboard note", "Homepage integration refreshes this Markdown note. .obsidian is forbidden.", settings.dashboardPath, (dashboardPath) => this.host.updateSettings({ dashboardPath }));
+    for (const status of this.host.getIntegrationStatuses()) {
+      new Setting(containerEl)
+        .setName(status.name)
+        .setDesc(`${status.detail}${status.version ? ` Installed version ${status.version}.` : ""}${status.available ? "" : " Companion plugin is not currently available."}`)
+        .addToggle((toggle) => toggle
+          .setValue(settings.integrations[status.id])
+          .setDisabled(!status.available)
+          .onChange(async (enabled) => this.host.updateSettings({ integrations: { ...this.host.getSettings().integrations, [status.id]: enabled } })));
+    }
+
+    new Setting(containerEl).setName("Accessibility and mobile").setHeading();
+    new Setting(containerEl).setName("Announce live activity").setDesc("Screen readers announce response, memory, and tool status changes.").addToggle((toggle) => toggle.setValue(settings.screenReaderAnnouncements).onChange(async (screenReaderAnnouncements) => this.host.updateSettings({ screenReaderAnnouncements })));
+    new Setting(containerEl).setName("Voice dictation").setDesc("Shows a microphone when the device supports browser speech recognition. The operating system or browser may use an online speech service.").addToggle((toggle) => toggle.setValue(settings.voiceInputEnabled).onChange(async (voiceInputEnabled) => this.host.updateSettings({ voiceInputEnabled })));
+    new Setting(containerEl).setName("Read responses aloud").setDesc("Shows a read-aloud response action using the device's speech synthesizer.").addToggle((toggle) => toggle.setValue(settings.readAloudEnabled).onChange(async (readAloudEnabled) => this.host.updateSettings({ readAloudEnabled })));
+    new Setting(containerEl).setName("Reduce motion").setDesc("Disables smooth scrolling, blinking cursors, and spinning activity icons.").addToggle((toggle) => toggle.setValue(settings.reduceMotion).onChange(async (reduceMotion) => this.host.updateSettings({ reduceMotion })));
+    new Setting(containerEl).setName("High contrast").setDesc("Strengthens borders and focus indicators inside VaultPilot.").addToggle((toggle) => toggle.setValue(settings.highContrast).onChange(async (highContrast) => this.host.updateSettings({ highContrast })));
+    new Setting(containerEl).setName("Large touch targets").setDesc("Uses at least 44×44 pixel controls on desktop and mobile.").addToggle((toggle) => toggle.setValue(settings.largeTouchTargets).onChange(async (largeTouchTargets) => this.host.updateSettings({ largeTouchTargets })));
+    numberSetting(containerEl, "Interface scale", "Scales VaultPilot chat text and controls without changing the rest of Obsidian.", settings.interfaceScale, 80, 160, 5, (interfaceScale) => this.host.updateSettings({ interfaceScale }));
+    new Setting(containerEl).setName("Show source explanations").setDesc("Show semantic, keyword, and graph relevance details when sources are returned.").addToggle((toggle) => toggle.setValue(settings.showSourceDetails).onChange(async (showSourceDetails) => this.host.updateSettings({ showSourceDetails })));
+
+    new Setting(containerEl).setName("Tool activity and undo").setHeading();
+    const audit = containerEl.createDiv({ cls: "vaultpilot-audit-list" });
+    this.renderAudit(audit);
+    new Setting(containerEl)
+      .addButton((button) => button.setButtonText("Undo last change").onClick(async () => {
+        try { new Notice(`Undid: ${await this.host.undoLatestToolChange()}`); } catch (error) { new Notice(errorMessage(error), 8000); }
+        this.display();
+      }))
+      .addButton((button) => button.setButtonText("Clear activity log").setWarning().onClick(() => {
+        this.host.clearToolAudit();
+        this.display();
+      }));
 
     new Setting(containerEl).setName("Conversation archiving").setHeading();
     textSetting(containerEl, "Archive folder", "Archive files use Topic@YYYY-MM-DD_HH-mm.md exactly. .obsidian is forbidden.", settings.conversationsFolder, (conversationsFolder) => this.host.updateSettings({ conversationsFolder }));
@@ -190,10 +262,73 @@ export class VaultPilotSettingTab extends PluginSettingTab {
     }
   }
 
+  private async renderMemoryManager(container: HTMLElement): Promise<void> {
+    try {
+      const entries = await this.host.getMemoryEntries();
+      if (!container.isConnected) return;
+      if (!entries.length) {
+        container.createEl("p", { cls: "vaultpilot-empty-setting", text: "No structured memory entries yet." });
+        return;
+      }
+      for (const entry of entries.slice(0, 100)) {
+        const row = container.createDiv({ cls: "vaultpilot-memory-entry" });
+        const body = row.createDiv();
+        body.createDiv({ cls: "vaultpilot-memory-content", text: entry.content });
+        body.createDiv({
+          cls: "vaultpilot-memory-meta",
+          text: `${entry.category} · ${entry.key} · confidence ${entry.confidence.toFixed(2)} · ${entry.updatedAt}`
+        });
+        const remove = row.createEl("button", { text: "Forget", attr: { "aria-label": `Forget memory: ${entry.content}` } });
+        remove.addEventListener("click", () => void (async () => {
+          remove.disabled = true;
+          await this.host.forgetMemory(entry.category, entry.key);
+          this.display();
+        })());
+      }
+    } catch (error) {
+      if (container.isConnected) container.createEl("p", { cls: "vaultpilot-empty-setting", text: `Memory manager unavailable: ${errorMessage(error)}` });
+    }
+  }
+
+  private renderAudit(container: HTMLElement): void {
+    const entries = this.host.getToolAuditEntries();
+    if (!entries.length) {
+      container.createEl("p", { cls: "vaultpilot-empty-setting", text: "No tool activity recorded yet." });
+      return;
+    }
+    for (const entry of entries.slice(0, 20)) {
+      const row = container.createDiv({ cls: `vaultpilot-audit-entry ${entry.ok ? "is-ok" : "is-error"}` });
+      row.createDiv({ cls: "vaultpilot-audit-title", text: entry.description });
+      row.createDiv({
+        cls: "vaultpilot-audit-meta",
+        text: `${entry.source} · ${entry.risk} · ${entry.ok ? "completed" : "blocked/failed"} · ${new Date(entry.createdAt).toLocaleString()}`
+      });
+      row.createDiv({ cls: "vaultpilot-audit-summary", text: entry.summary });
+    }
+  }
+
   private async updateCommand(id: string, patch: Partial<CustomCommand>): Promise<void> {
     const customCommands = this.host.getSettings().customCommands.map((command) => command.id === id ? { ...command, ...patch } : command);
     await this.host.updateSettings({ customCommands });
   }
+}
+
+function policySetting(
+  container: HTMLElement,
+  name: string,
+  description: string,
+  value: ToolPolicy,
+  onChange: (value: ToolPolicy) => Promise<void>,
+  allowAutomatic = true
+): void {
+  new Setting(container).setName(name).setDesc(description).addDropdown((dropdown) => {
+    if (allowAutomatic) dropdown.addOption("automatic", "Run automatically");
+    dropdown
+      .addOption("manual", "Always ask")
+      .addOption("disabled", "Disabled")
+      .setValue(allowAutomatic ? value : value === "automatic" ? "manual" : value)
+      .onChange(async (next) => onChange(next as ToolPolicy));
+  });
 }
 
 function textSetting(

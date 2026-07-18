@@ -1,4 +1,25 @@
 export type ExecutionMode = "automatic" | "manual";
+export type ToolPolicy = "automatic" | "manual" | "disabled";
+
+export interface ToolPolicies {
+  read: ToolPolicy;
+  network: ToolPolicy;
+  write: ToolPolicy;
+  sync: ToolPolicy;
+}
+
+export interface IntegrationSettings {
+  tasks: boolean;
+  homepage: boolean;
+  bases: boolean;
+  dailyNotes: boolean;
+  adaptivePractice: boolean;
+  remotelySave: boolean;
+  smartEnvironmentExperimental: boolean;
+  canvas: boolean;
+}
+
+export type MemoryInterceptMode = "background" | "blocking";
 
 export interface CustomCommand {
   id: string;
@@ -15,6 +36,7 @@ export interface VaultPilotSettings {
   maxOutputTokens: number;
   maxAgentSteps: number;
   executionMode: ExecutionMode;
+  toolPolicies: ToolPolicies;
   systemPrompt: string;
   showStatusBarCost: boolean;
   inputPricePerMillion: number;
@@ -29,6 +51,9 @@ export interface VaultPilotSettings {
   chunkSize: number;
   chunkOverlap: number;
   maxChunksPerFile: number;
+  embeddingBatchSize: number;
+  searchCacheSize: number;
+  mobileIndexingEnabled: boolean;
   semanticWeight: number;
   lexicalWeight: number;
   graphWeight: number;
@@ -36,10 +61,21 @@ export interface VaultPilotSettings {
   memoryEnabled: boolean;
   memoryFolder: string;
   memoryInterceptEnabled: boolean;
+  memoryInterceptMode: MemoryInterceptMode;
   memoryThreshold: number;
   memoryModel: string;
   conversationHistoryLimit: number;
   conversationsFolder: string;
+  dashboardPath: string;
+  integrations: IntegrationSettings;
+  showSourceDetails: boolean;
+  screenReaderAnnouncements: boolean;
+  voiceInputEnabled: boolean;
+  readAloudEnabled: boolean;
+  reduceMotion: boolean;
+  highContrast: boolean;
+  largeTouchTargets: boolean;
+  interfaceScale: number;
   customCommands: CustomCommand[];
 }
 
@@ -92,6 +128,7 @@ export interface PersistedData {
   sessions: ChatSession[];
   activeSessionId: string;
   vaultId: string;
+  toolAudit?: ToolAuditEntry[];
 }
 
 export interface GeminiFunctionCall {
@@ -145,12 +182,15 @@ export interface FunctionDeclaration {
   parameters: Record<string, unknown>;
 }
 
-export type ToolRisk = "read" | "network" | "write";
+export type ToolRisk = "read" | "network" | "write" | "sync";
 
 export interface ToolDefinition {
   declaration: FunctionDeclaration;
   risk: ToolRisk;
+  source?: string;
+  isAvailable?(): boolean;
   describe(args: Record<string, unknown>): string;
+  preview?(args: Record<string, unknown>): Promise<string>;
   execute(args: Record<string, unknown>): Promise<Record<string, unknown>>;
 }
 
@@ -158,6 +198,45 @@ export interface ToolApprovalRequest {
   call: GeminiFunctionCall;
   description: string;
   risk: ToolRisk;
+  preview?: string;
+}
+
+export interface ToolAuditEntry {
+  id: string;
+  createdAt: number;
+  tool: string;
+  description: string;
+  risk: ToolRisk;
+  source: string;
+  ok: boolean;
+  summary: string;
+  undo?: ToolUndoRecord;
+}
+
+export interface ToolUndoRecord {
+  kind: "restore" | "delete-created";
+  path: string;
+  content?: string;
+  expectedContent?: string;
+}
+
+export interface IntegrationStatus {
+  id: keyof IntegrationSettings;
+  name: string;
+  enabled: boolean;
+  available: boolean;
+  version?: string;
+  detail: string;
+}
+
+export interface MemoryEntry {
+  category: "user_profile" | "core_facts" | "project_contexts" | "preferences";
+  key: string;
+  content: string;
+  confidence: number;
+  createdAt: string;
+  updatedAt: string;
+  source: string;
 }
 
 export interface AgentCallbacks {
@@ -174,7 +253,7 @@ export interface VectorRecord {
   path: string;
   chunkIndex: number;
   text: string;
-  embedding: number[];
+  embedding: number[] | Float32Array;
   mtime: number;
   contentHash: string;
 }
@@ -195,6 +274,7 @@ export interface SearchResult {
   graphScore: number;
   snippet: string;
   chunkIndex: number;
+  reasons?: string[];
 }
 
 export interface IndexProgress {

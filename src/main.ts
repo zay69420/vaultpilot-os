@@ -2,9 +2,11 @@ import { MarkdownView, Notice, Platform, Plugin, TFile, WorkspaceLeaf } from "ob
 import { isForbiddenVaultPath } from "./security/pathGuard";
 import { DEFAULT_SETTINGS, mergeSettings } from "./settings/defaults";
 import { AgentService } from "./services/agentService";
+import { AuditService } from "./services/auditService";
 import { ArchiveService } from "./services/archiveService";
 import { GeminiClient } from "./services/geminiClient";
 import { IndexService } from "./services/indexService";
+import { IntegrationService } from "./services/integrationService";
 import { MemoryService } from "./services/memoryService";
 import { obsidianGeminiTransport } from "./services/obsidianTransport";
 import { SearchService } from "./services/searchService";
@@ -12,11 +14,12 @@ import { ToolRegistry } from "./services/toolRegistry";
 import { AttachmentStore } from "./storage/attachmentStore";
 import { SessionStore } from "./storage/sessionStore";
 import { VectorStore } from "./storage/vectorStore";
-import type { AgentCallbacks, ChatMessage, ChatSession, CustomCommand, ImageAttachmentInput, PersistedData, VaultPilotSettings } from "./types";
+import type { AgentCallbacks, ChatMessage, ChatSession, CustomCommand, ImageAttachmentInput, IntegrationStatus, MemoryEntry, PersistedData, ToolAuditEntry, VaultPilotSettings } from "./types";
 import { createId } from "./utils/id";
 import { imageLimits, validateImageCandidate } from "./utils/imageAttachments";
 import { CHAT_VIEW_TYPE, VaultPilotChatView, type ChatViewHost } from "./ui/chatView";
 import { VaultPilotSettingTab, type SettingsHost } from "./ui/settingsTab";
+import { VaultPilotPriorityBasesView } from "./ui/priorityBasesView";
 
 export default class VaultPilotPlugin extends Plugin implements ChatViewHost, SettingsHost {
   private config: VaultPilotSettings = { ...DEFAULT_SETTINGS };
@@ -25,12 +28,17 @@ export default class VaultPilotPlugin extends Plugin implements ChatViewHost, Se
   private vectors!: VectorStore;
   private attachments!: AttachmentStore;
   private indexer!: IndexService;
+  private search!: SearchService;
+  private integrations!: IntegrationService;
+  private audit!: AuditService;
+  private tools!: ToolRegistry;
   private memory!: MemoryService;
   private agent!: AgentService;
   private archive!: ArchiveService;
   private activeController: AbortController | null = null;
   private statusBarEl: HTMLElement | null = null;
   private saveHandle: number | null = null;
+  private basesViewRegistered = false;
   private registeredCustomCommandIds = new Set<string>();
   private vaultId = "";
 
@@ -57,13 +65,15 @@ export default class VaultPilotPlugin extends Plugin implements ChatViewHost, Se
     await this.attachments.prune(this.sessions.allAttachmentIds());
     startupStage = "creating services";
     this.indexer = new IndexService(this.app, this.vectors, this.gemini, () => this.config);
-    const search = new SearchService(this.app, this.vectors, this.gemini, () => this.config);
-    const tools = new ToolRegistry(this.app, search, () => this.config);
+    this.search = new SearchService(this.app, this.vectors, this.gemini, () => this.config);
+    this.integrations = new IntegrationService(this.app, () => this.config);
+    this.audit = new AuditService(this.app, stored?.toolAudit, () => this.scheduleSave());
+    this.tools = new ToolRegistry(this.app, this.search, this.integrations, this.audit, () => this.config);
     this.memory = new MemoryService(this.app, this.gemini, () => this.config);
     this.agent = new AgentService(
       this.gemini,
       this.memory,
-      tools,
+      this.tools,
       () => this.config,
       () => this.sessions.context(
         this.config.conversationHistoryLimit,
@@ -75,6 +85,7 @@ export default class VaultPilotPlugin extends Plugin implements ChatViewHost, Se
 
     startupStage = "registering the Obsidian interface";
     this.registerView(CHAT_VIEW_TYPE, (leaf) => new VaultPilotChatView(leaf, this));
+    if (this.config.integrations.bases) this.registerPriorityBasesView();
     this.addRibbonIcon("bot", "Open VaultPilot OS", () => void this.activateChat());
     if (!Platform.isMobile) {
       this.statusBarEl = this.addStatusBarItem();
@@ -122,6 +133,13 @@ export default class VaultPilotPlugin extends Plugin implements ChatViewHost, Se
     return new Blob([attachment.data], { type: attachment.mimeType });
   }
 
+  async insertIntoActiveNote(content: string): Promise<string> {
+    const file = this.app.workspace.getActiveFile();
+    if (!file || isForbiddenVaultPath(file.path)) throw new Error("Open a safe Markdown note before inserting the response.");
+    await this.tools.execute("edit_note", { path: file.path, operation: "append", content }, `Insert response into "${file.path}"`);
+    return file.path;
+  }
+
   isChatRunning(): boolean {
     return this.activeController !== null;
   }
@@ -132,11 +150,39 @@ export default class VaultPilotPlugin extends Plugin implements ChatViewHost, Se
       this.config.apiKey = this.app.secretStorage.getSecret(this.config.apiKeySecretId) ?? "";
     }
     this.registerCustomCommands();
+    if (patch.integrations?.bases) this.registerPriorityBasesView();
     this.updateStatusBar();
+    this.refreshViews();
     this.scheduleSave();
     if (patch.memoryEnabled === true || patch.memoryFolder !== undefined) {
       await this.memory.initialize().catch((error) => new Notice(errorMessage(error), 7000));
     }
+  }
+
+  getIntegrationStatuses(): IntegrationStatus[] {
+    return this.integrations.statuses();
+  }
+
+  getToolAuditEntries(): ToolAuditEntry[] {
+    return this.audit.entries(40);
+  }
+
+  async getMemoryEntries(): Promise<MemoryEntry[]> {
+    return this.memory.listEntries();
+  }
+
+  async forgetMemory(category: MemoryEntry["category"], key: string): Promise<boolean> {
+    return this.memory.forget(category, key);
+  }
+
+  clearToolAudit(): void {
+    this.audit.clear();
+  }
+
+  async undoLatestToolChange(): Promise<string> {
+    const entry = await this.audit.undoLatest();
+    this.refreshViews();
+    return entry.description;
   }
 
   async testGeminiConnection(): Promise<string> {
@@ -165,6 +211,7 @@ export default class VaultPilotPlugin extends Plugin implements ChatViewHost, Se
     this.activeController = controller;
     let assistant: ChatMessage | null = null;
     let response = "";
+    const sessionId = this.sessions.activeSessionId();
 
     try {
       const storedAttachments = await this.attachments.saveMany(imageAttachments);
@@ -175,11 +222,11 @@ export default class VaultPilotPlugin extends Plugin implements ChatViewHost, Se
         ...callbacks,
         onText: (delta) => {
           response += delta;
-          this.sessions.updateMessage(assistantId, response);
+          this.sessions.updateMessage(assistantId, response, sessionId);
           callbacks.onText(delta);
         },
         onUsage: (usage) => {
-          this.sessions.addUsage(usage);
+          this.sessions.addUsage(usage, sessionId);
           this.updateStatusBar();
           callbacks.onUsage(usage);
         }
@@ -187,7 +234,7 @@ export default class VaultPilotPlugin extends Plugin implements ChatViewHost, Se
       await this.agent.run(normalizedMessage, wrapped, controller.signal);
       if (!response.trim()) {
         response = "No response was returned.";
-        this.sessions.updateMessage(assistantId, response);
+        this.sessions.updateMessage(assistantId, response, sessionId);
         callbacks.onText(response);
       }
     } catch (error) {
@@ -198,7 +245,7 @@ export default class VaultPilotPlugin extends Plugin implements ChatViewHost, Se
       const stopped = controller.signal.aborted || (error instanceof DOMException && error.name === "AbortError");
       if (!response.trim()) {
         response = stopped ? "Stopped." : `Error: ${errorMessage(error)}`;
-        this.sessions.updateMessage(assistant.id, response);
+        this.sessions.updateMessage(assistant.id, response, sessionId);
         callbacks.onText(response);
       }
       if (!stopped) throw error;
@@ -270,6 +317,15 @@ export default class VaultPilotPlugin extends Plugin implements ChatViewHost, Se
     }
   }
 
+  private registerPriorityBasesView(): void {
+    if (this.basesViewRegistered) return;
+    this.basesViewRegistered = this.registerBasesView("vaultpilot-priority", {
+      name: "VaultPilot Priority",
+      icon: "list-checks",
+      factory: (controller, containerEl) => new VaultPilotPriorityBasesView(controller, containerEl)
+    });
+  }
+
   private registerCoreCommands(): void {
     this.addCommand({
       id: "open-chat",
@@ -298,6 +354,30 @@ export default class VaultPilotPlugin extends Plugin implements ChatViewHost, Se
       id: "rebuild-vector-index",
       name: "Rebuild local vector index",
       callback: () => void this.rebuildSearchIndex().then(() => new Notice("VaultPilot OS index rebuilt.")).catch((error) => new Notice(errorMessage(error), 8000))
+    });
+    this.addCommand({
+      id: "undo-last-change",
+      name: "Undo last VaultPilot file change",
+      callback: () => void this.undoLatestToolChange()
+        .then((description) => new Notice(`Undid: ${description}`))
+        .catch((error) => new Notice(errorMessage(error), 8000))
+    });
+    this.addCommand({
+      id: "refresh-productivity-dashboard",
+      name: "Refresh productivity dashboard",
+      callback: () => void this.tools.execute("refresh_productivity_dashboard", {}, "Refresh productivity dashboard")
+        .then(() => new Notice("VaultPilot dashboard refreshed."))
+        .catch((error) => new Notice(errorMessage(error), 8000))
+    });
+    this.addCommand({
+      id: "create-daily-briefing",
+      name: "Create daily briefing",
+      callback: () => void this.activateChat().then((view) => view.submitExternal("Create a concise daily briefing from my open tasks, active projects, and relevant recent vault context, then write it to today's daily note."))
+    });
+    this.addCommand({
+      id: "plan-my-day",
+      name: "Plan my day",
+      callback: () => void this.activateChat().then((view) => view.submitExternal("Review my open and overdue tasks and relevant project notes. Produce a realistic prioritized plan for today with time blocks, dependencies, and a short fallback plan."))
     });
   }
 
@@ -335,13 +415,19 @@ export default class VaultPilotPlugin extends Plugin implements ChatViewHost, Se
 
   private registerVaultEvents(): void {
     this.registerEvent(this.app.vault.on("create", (file) => {
+      this.search.invalidateGraph();
       if (file instanceof TFile && file.extension.toLocaleLowerCase() === "md") this.indexer.scheduleFile(file);
     }));
     this.registerEvent(this.app.vault.on("modify", (file) => {
+      this.search.invalidateGraph();
       if (file instanceof TFile && file.extension.toLocaleLowerCase() === "md") this.indexer.scheduleFile(file);
     }));
-    this.registerEvent(this.app.vault.on("delete", (file) => this.indexer.scheduleFile(file.path)));
+    this.registerEvent(this.app.vault.on("delete", (file) => {
+      this.search.invalidateGraph();
+      this.indexer.scheduleFile(file.path);
+    }));
     this.registerEvent(this.app.vault.on("rename", (file, oldPath) => {
+      this.search.invalidateGraph();
       this.indexer.scheduleFile(oldPath);
       if (file instanceof TFile && file.extension.toLocaleLowerCase() === "md") this.indexer.scheduleFile(file);
     }));
@@ -394,7 +480,8 @@ export default class VaultPilotPlugin extends Plugin implements ChatViewHost, Se
       settings: { ...this.config, apiKey: "" },
       sessions: this.sessions.all(),
       activeSessionId: this.sessions.activeSessionId(),
-      vaultId: this.vaultId
+      vaultId: this.vaultId,
+      toolAudit: this.audit?.entries(300).reverse()
     };
     await this.saveData(data);
   }

@@ -19,6 +19,12 @@ export const DEFAULT_SETTINGS: VaultPilotSettings = {
   maxOutputTokens: 8192,
   maxAgentSteps: 8,
   executionMode: "automatic",
+  toolPolicies: {
+    read: "automatic",
+    network: "manual",
+    write: "manual",
+    sync: "manual"
+  },
   systemPrompt: DEFAULT_SYSTEM_PROMPT,
   showStatusBarCost: true,
   inputPricePerMillion: 1.5,
@@ -33,6 +39,9 @@ export const DEFAULT_SETTINGS: VaultPilotSettings = {
   chunkSize: 3200,
   chunkOverlap: 320,
   maxChunksPerFile: 100,
+  embeddingBatchSize: 16,
+  searchCacheSize: 30,
+  mobileIndexingEnabled: true,
   semanticWeight: 0.65,
   lexicalWeight: 0.25,
   graphWeight: 0.1,
@@ -40,10 +49,30 @@ export const DEFAULT_SETTINGS: VaultPilotSettings = {
   memoryEnabled: true,
   memoryFolder: "memory",
   memoryInterceptEnabled: true,
+  memoryInterceptMode: "background",
   memoryThreshold: 0.78,
   memoryModel: "gemini-3.1-flash-lite",
   conversationHistoryLimit: 5,
   conversationsFolder: "conversations",
+  dashboardPath: "VaultPilot Dashboard.md",
+  integrations: {
+    tasks: true,
+    homepage: true,
+    bases: true,
+    dailyNotes: true,
+    adaptivePractice: true,
+    remotelySave: false,
+    smartEnvironmentExperimental: false,
+    canvas: true
+  },
+  showSourceDetails: true,
+  screenReaderAnnouncements: true,
+  voiceInputEnabled: false,
+  readAloudEnabled: true,
+  reduceMotion: false,
+  highContrast: false,
+  largeTouchTargets: true,
+  interfaceScale: 100,
   customCommands: [
     {
       id: "summarize-current-note",
@@ -57,6 +86,14 @@ export function mergeSettings(value: Partial<VaultPilotSettings> | null | undefi
   const merged: VaultPilotSettings = {
     ...DEFAULT_SETTINGS,
     ...(value ?? {}),
+    toolPolicies: {
+      ...DEFAULT_SETTINGS.toolPolicies,
+      ...(value?.toolPolicies ?? {})
+    },
+    integrations: {
+      ...DEFAULT_SETTINGS.integrations,
+      ...(value?.integrations ?? {})
+    },
     customCommands: Array.isArray(value?.customCommands)
       ? value.customCommands.filter((command) => Boolean(command?.id && command?.name && command?.prompt))
       : DEFAULT_SETTINGS.customCommands.map((command) => ({ ...command }))
@@ -68,9 +105,12 @@ export function mergeSettings(value: Partial<VaultPilotSettings> | null | undefi
   merged.chunkSize = clampInteger(merged.chunkSize, 500, 12000);
   merged.chunkOverlap = clampInteger(merged.chunkOverlap, 0, Math.max(0, merged.chunkSize - 1));
   merged.maxChunksPerFile = clampInteger(merged.maxChunksPerFile, 1, 1000);
+  merged.embeddingBatchSize = clampInteger(merged.embeddingBatchSize, 1, 100);
+  merged.searchCacheSize = clampInteger(merged.searchCacheSize, 0, 200);
   merged.searchResultLimit = clampInteger(merged.searchResultLimit, 1, 30);
   merged.conversationHistoryLimit = clampInteger(merged.conversationHistoryLimit, 0, 20);
   merged.maxImagesPerMessage = clampInteger(merged.maxImagesPerMessage, 1, 8);
+  merged.interfaceScale = clampInteger(merged.interfaceScale, 80, 160);
   merged.temperature = clampNumber(merged.temperature, 0, 2);
   merged.memoryThreshold = clampNumber(merged.memoryThreshold, 0, 1);
   merged.maxImageRequestMb = clampNumber(merged.maxImageRequestMb, 1, 12);

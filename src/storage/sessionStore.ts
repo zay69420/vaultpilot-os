@@ -64,16 +64,20 @@ export class SessionStore {
     return message;
   }
 
-  updateMessage(id: string, content: string): void {
-    const message = this.active().messages.find((candidate) => candidate.id === id);
+  updateMessage(id: string, content: string, sessionId?: string): void {
+    const session = sessionId ? this.sessions.find((candidate) => candidate.id === sessionId) : this.active();
+    if (!session) return;
+    const message = session.messages.find((candidate) => candidate.id === id);
     if (!message) return;
     message.content = content;
-    this.active().updatedAt = Date.now();
+    session.updatedAt = Date.now();
     this.onChange();
   }
 
-  addUsage(usage: TokenUsage): void {
-    const total = this.active().usage;
+  addUsage(usage: TokenUsage, sessionId?: string): void {
+    const session = sessionId ? this.sessions.find((candidate) => candidate.id === sessionId) : this.active();
+    if (!session) return;
+    const total = session.usage;
     total.inputTokens += usage.inputTokens;
     total.outputTokens += usage.outputTokens;
     total.totalTokens += usage.totalTokens;

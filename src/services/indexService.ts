@@ -1,4 +1,4 @@
-import { App, TFile } from "obsidian";
+import { App, Platform, TFile } from "obsidian";
 import { isForbiddenVaultPath } from "../security/pathGuard";
 import { VectorStore } from "../storage/vectorStore";
 import type { IndexProgress, IndexedFileMeta, VaultPilotSettings, VectorRecord } from "../types";
@@ -22,6 +22,10 @@ export class IndexService {
   }
 
   async indexChangedFiles(onProgress?: (progress: IndexProgress) => void, signal?: AbortSignal): Promise<void> {
+    if (Platform.isMobile && !this.getSettings().mobileIndexingEnabled) {
+      onProgress?.({ completed: 0, total: 0 });
+      return;
+    }
     return this.runExclusive(async () => {
       const files = this.app.vault.getMarkdownFiles().filter((file) => !isForbiddenVaultPath(file.path));
       const known = new Map((await this.store.getAllFileMeta()).map((meta) => [meta.path, meta]));
@@ -97,20 +101,35 @@ export class IndexService {
     const contentHash = fnv1a(content);
     const chunks = chunkMarkdown(content, settings.chunkSize, settings.chunkOverlap, settings.maxChunksPerFile);
     const records: VectorRecord[] = [];
-    for (let index = 0; index < chunks.length; index += 1) {
+    const batchSize = Math.max(1, Math.min(100, settings.embeddingBatchSize));
+    for (let start = 0; start < chunks.length; start += batchSize) {
       assertNotAborted(signal);
-      const text = chunks[index];
-      if (!text) continue;
-      const embedding = await this.gemini.embed(`${file.basename}\n\n${text}`, signal);
-      records.push({
-        id: `${fnv1a(file.path)}:${index}:${contentHash}`,
-        path: file.path,
-        chunkIndex: index,
-        text,
-        embedding,
-        mtime: file.stat.mtime,
-        contentHash
-      });
+      const slice = chunks.slice(start, start + batchSize);
+      let embeddings: number[][];
+      try {
+        embeddings = await this.gemini.embedBatch(slice.map((text) => `${file.basename}\n\n${text}`), signal);
+      } catch (error) {
+        if (signal?.aborted) throw error;
+        console.warn("VaultPilot batch embedding failed; retrying the batch one item at a time", error);
+        embeddings = [];
+        for (const text of slice) embeddings.push(await this.gemini.embed(`${file.basename}\n\n${text}`, signal));
+      }
+      for (let offset = 0; offset < slice.length; offset += 1) {
+        const text = slice[offset];
+        const embedding = embeddings[offset];
+        if (!text || !embedding) continue;
+        const index = start + offset;
+        records.push({
+          id: `${fnv1a(file.path)}:${index}:${contentHash}`,
+          path: file.path,
+          chunkIndex: index,
+          text,
+          embedding: new Float32Array(embedding),
+          mtime: file.stat.mtime,
+          contentHash
+        });
+      }
+      await yieldToUi();
     }
     const meta: IndexedFileMeta = {
       path: file.path,
@@ -132,6 +151,10 @@ export class IndexService {
       if (this.activeRun === run) this.activeRun = null;
     }
   }
+}
+
+function yieldToUi(): Promise<void> {
+  return new Promise((resolve) => globalThis.setTimeout(resolve, 0));
 }
 
 function assertNotAborted(signal?: AbortSignal): void {

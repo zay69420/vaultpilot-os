@@ -6,6 +6,9 @@ const FILES_STORE = "files";
 
 export class VectorStore {
   private database: IDBDatabase | null = null;
+  private chunksCache: VectorRecord[] | null = null;
+  private filesCache: IndexedFileMeta[] | null = null;
+  private cacheRevision = 0;
 
   constructor(private readonly vaultIdentifier: string) {}
 
@@ -37,18 +40,24 @@ export class VectorStore {
   close(): void {
     this.database?.close();
     this.database = null;
+    this.chunksCache = null;
+    this.filesCache = null;
   }
 
   async getAllChunks(): Promise<VectorRecord[]> {
+    if (this.chunksCache) return this.chunksCache;
     const transaction = this.transaction([CHUNKS_STORE], "readonly");
     const request = transaction.objectStore(CHUNKS_STORE).getAll();
-    return requestResult<VectorRecord[]>(request);
+    this.chunksCache = await requestResult<VectorRecord[]>(request);
+    return this.chunksCache;
   }
 
   async getAllFileMeta(): Promise<IndexedFileMeta[]> {
+    if (this.filesCache) return this.filesCache;
     const transaction = this.transaction([FILES_STORE], "readonly");
     const request = transaction.objectStore(FILES_STORE).getAll();
-    return requestResult<IndexedFileMeta[]>(request);
+    this.filesCache = await requestResult<IndexedFileMeta[]>(request);
+    return this.filesCache;
   }
 
   async getFileMeta(path: string): Promise<IndexedFileMeta | undefined> {
@@ -73,6 +82,9 @@ export class VectorStore {
       transaction.objectStore(FILES_STORE).put(meta);
     };
     await transactionDone(transaction);
+    if (this.chunksCache) this.chunksCache = [...this.chunksCache.filter((record) => record.path !== meta.path), ...records];
+    if (this.filesCache) this.filesCache = [...this.filesCache.filter((record) => record.path !== meta.path), meta];
+    this.cacheRevision += 1;
   }
 
   async deleteFile(path: string): Promise<void> {
@@ -89,6 +101,9 @@ export class VectorStore {
       transaction.objectStore(FILES_STORE).delete(path);
     };
     await transactionDone(transaction);
+    if (this.chunksCache) this.chunksCache = this.chunksCache.filter((record) => record.path !== path);
+    if (this.filesCache) this.filesCache = this.filesCache.filter((record) => record.path !== path);
+    this.cacheRevision += 1;
   }
 
   async clear(): Promise<void> {
@@ -96,6 +111,13 @@ export class VectorStore {
     transaction.objectStore(CHUNKS_STORE).clear();
     transaction.objectStore(FILES_STORE).clear();
     await transactionDone(transaction);
+    this.chunksCache = [];
+    this.filesCache = [];
+    this.cacheRevision += 1;
+  }
+
+  revision(): number {
+    return this.cacheRevision;
   }
 
   private transaction(stores: string[], mode: IDBTransactionMode): IDBTransaction {

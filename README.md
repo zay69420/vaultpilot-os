@@ -8,15 +8,17 @@ There is no VaultPilot subscription, hosted proxy, or middle-man service.
 
 - Native desktop sidebar and full-tab mobile `ItemView` chat
 - Mobile-safe Gemini networking through Obsidian's native request bridge
-- Touch-sized controls, safe-area padding, and virtual-keyboard-aware composing
+- Touch-sized controls, safe-area padding, virtual-keyboard-aware composing, camera/photo selection, and optional dictation
 - Desktop/mobile image picker with previews, paste support, and Gemini multimodal analysis
 - Native Gemini function-calling agent loop with configurable step limit
-- Automatic tool execution or inline manual Allow/Deny approvals
+- Per-category read, network, write, and sync policies with previews, an activity log, and guarded undo
 - Hard-coded `.obsidian` forbidden zone beneath every model-accessible file tool
 - Vault search, note read/create/edit, and free DuckDuckGo HTML web search tools
-- IndexedDB vector storage with incremental startup and file-event indexing
-- Hybrid semantic, lexical, and first-degree graph/backlink relevance
-- Segmented `memory/` notes with proactive fact extraction and pre-query retrieval
+- IndexedDB vector storage with incremental, batched startup and file-event indexing
+- Cached hybrid semantic, lexical, and first-degree graph/backlink relevance with ranking explanations
+- Structured, user-manageable `memory/` entries with proactive background extraction and pre-query retrieval
+- Optional productivity adapters for Tasks, Homepage, Bases, Daily Notes, Adaptive Practice, Remotely Save, Canvas, and Smart semantic views
+- Accessible quick actions, screen-reader status, high contrast, reduced motion, interface scaling, and optional read-aloud
 - Adjustable recent-conversation context buffer, defaulting to five sessions
 - Strict `Topic@YYYY-MM-DD_HH-mm.md` conversation archives
 - User-defined Command Palette prompts with current-note and selection placeholders
@@ -33,7 +35,7 @@ There is no VaultPilot subscription, hosted proxy, or middle-man service.
 
 The install-ready folder contains `manifest.json`, `main.js`, and `styles.css`.
 
-VaultPilot 1.2.0 requires Obsidian 1.11.4 or newer so Gemini credentials can use Obsidian SecretStorage.
+VaultPilot 1.3.0 requires Obsidian 1.11.4 or newer so Gemini credentials can use Obsidian SecretStorage and the current Bases API.
 
 ### Obsidian mobile
 
@@ -44,7 +46,7 @@ The same package supports iOS and Android; there is no separate reduced feature 
 3. Open **Settings > VaultPilot OS**, add the Gemini key on that device if it was not synced, and use **Test connection**.
 4. Open the robot ribbon action or run **VaultPilot OS: Open chat**. Mobile opens chat as a full workspace tab instead of a narrow sidebar.
 
-On-screen Enter inserts a newline on mobile; tap **Send** to submit. A connected hardware keyboard can submit with Ctrl+Enter or Cmd+Enter. The image button opens the native iOS/Android photo picker. Session cost remains in the chat header because Obsidian mobile has no bottom status bar.
+On-screen Enter inserts a newline on mobile; tap **Send** to submit. A connected hardware keyboard can submit with Ctrl+Enter or Cmd+Enter. The image button opens the native iOS/Android photo or camera chooser. Session cost remains in the chat header because Obsidian mobile has no bottom status bar. Mobile indexing can be disabled independently to save battery while retaining the existing local index.
 
 ### Build from source
 
@@ -100,7 +102,7 @@ Startup indexing compares Obsidian file modification time and size against Index
 2. lexical term and exact-phrase relevance; and
 3. a structural boost for outgoing links and backlinks one edge away from the strongest semantic results.
 
-Weights, dimensions, chunk size, overlap, result count, and indexing behavior are adjustable. If semantic query embedding is unavailable, search falls back to lexical retrieval.
+Embedding chunks are batched, compact vectors and recent queries are cached, scoring yields to the interface, and graph adjacency is reused. Search does not reread every Markdown note on every query. Weights, dimensions, batch size, cache size, chunking, and mobile indexing are adjustable. If semantic query embedding is unavailable, search falls back to indexed lexical retrieval.
 
 ## Memory behavior
 
@@ -111,7 +113,20 @@ Memory is kept separately from conversation archives in:
 - `memory/project_contexts.md`
 - `memory/preferences.md`
 
-Before the main agent turn, a lightweight configurable Gemini model examines the newest user interaction. Only durable facts above the confidence threshold are upserted. Credential-like values and explicitly sensitive secret categories are rejected. Relevant memory is then retrieved into a hidden, clearly delimited context block. The feature and threshold are configurable.
+A lightweight configurable Gemini model examines the newest interaction. Background mode keeps the main response responsive; blocking mode remains available. Only durable facts above the confidence threshold are upserted with source, confidence, creation date, and update date. Credential-like values and explicitly sensitive categories are rejected. Relevant individual entries—not whole memory files—are retrieved into a hidden context block. Settings include a memory manager for inspecting and forgetting entries.
+
+## Productivity integrations
+
+Every companion integration is optional, detected at runtime, and safe when the companion plugin is missing. VaultPilot never imports another plugin's bundle or reads its `.obsidian` data files.
+
+- **Tasks:** search open/completed/overdue tasks, create and update tasks, and toggle completion through Tasks `apiV1` with a Markdown fallback.
+- **Homepage:** refresh a daily command-center note and open the configured homepage.
+- **Bases:** register an accessible **VaultPilot Priority** view.
+- **Daily Notes:** open today and append generated briefings.
+- **Adaptive Practice:** launch only allowlisted dashboard, daily, resume, current-note, and plan commands.
+- **Remotely Save:** disabled by default; dry-run and sync actions always require confirmation and never read credentials.
+- **Canvas:** create new project or study maps without overwriting an existing canvas.
+- **Smart Connections / Smart Lookup:** experimental navigation only until those plugins expose a stable public retrieval API. VaultPilot does not access their private indexes.
 
 ## Custom Command Palette prompts
 

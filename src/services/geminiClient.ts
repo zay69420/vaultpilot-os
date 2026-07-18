@@ -114,6 +114,31 @@ export class GeminiClient {
     return values;
   }
 
+  async embedBatch(texts: string[], signal?: AbortSignal): Promise<number[][]> {
+    if (texts.length === 0) return [];
+    const settings = this.requireSettings();
+    const model = settings.embeddingModel.replace(/^models\//, "");
+    const batches: number[][] = [];
+    for (let start = 0; start < texts.length; start += 100) {
+      const slice = texts.slice(start, start + 100);
+      const body = {
+        requests: slice.map((text) => ({
+          model: `models/${model}`,
+          content: { parts: [{ text }] },
+          outputDimensionality: settings.embeddingDimensions
+        }))
+      };
+      const response = await this.request(model, "batchEmbedContents", body, signal);
+      const data = (await response.json()) as { embeddings?: Array<{ values?: number[] }> };
+      const values = data.embeddings?.map((embedding) => embedding.values ?? []) ?? [];
+      if (values.length !== slice.length || values.some((embedding) => embedding.length === 0)) {
+        throw new Error("Gemini returned an incomplete batch of embedding vectors.");
+      }
+      batches.push(...values);
+    }
+    return batches;
+  }
+
   private async generateTurnWithoutStreaming(options: GenerateOptions): Promise<GeminiTurnResult> {
     const settings = this.requireSettings();
     const response = await this.request(

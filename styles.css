@@ -1,11 +1,18 @@
 .vaultpilot-view {
   --vp-accent: var(--interactive-accent);
   --vp-border: var(--background-modifier-border);
+  --vp-interface-scale: 1;
   display: flex;
   flex-direction: column;
   height: 100%;
   overflow: hidden;
   background: var(--background-primary);
+}
+
+.vaultpilot-view .vaultpilot-bubble,
+.vaultpilot-view .vaultpilot-input,
+.vaultpilot-view .vaultpilot-status {
+  font-size: calc(var(--font-ui-small) * var(--vp-interface-scale));
 }
 
 .vaultpilot-header {
@@ -123,6 +130,20 @@
   margin: 0;
   font-size: var(--font-ui-small);
   line-height: 1.5;
+}
+
+.vaultpilot-quick-actions {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 7px;
+  width: min(100%, 420px);
+  margin-top: 18px;
+}
+
+.vaultpilot-quick-action {
+  min-height: 38px;
+  padding: 7px 10px;
+  white-space: normal;
 }
 
 .vaultpilot-message-row {
@@ -243,6 +264,22 @@
   overflow-x: auto;
 }
 
+.vaultpilot-response-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 2px;
+  margin-top: 7px;
+  padding-top: 6px;
+  border-top: 1px solid var(--vp-border);
+}
+
+.vaultpilot-response-action {
+  width: 30px;
+  height: 30px;
+  padding: 6px;
+  color: var(--text-muted);
+}
+
 .vaultpilot-tool-events {
   display: flex;
   flex-direction: column;
@@ -292,6 +329,11 @@
   background: color-mix(in srgb, var(--color-red) 7%, var(--background-secondary));
 }
 
+.vaultpilot-approval.risk-sync {
+  border-color: var(--color-red);
+  background: color-mix(in srgb, var(--color-red) 10%, var(--background-secondary));
+}
+
 .vaultpilot-approval-title {
   display: flex;
   align-items: center;
@@ -330,12 +372,25 @@
 .vaultpilot-composer {
   display: grid;
   flex: 0 0 auto;
-  grid-template-columns: auto minmax(0, 1fr) auto;
+  grid-template-columns: auto minmax(0, 1fr) auto auto;
   align-items: end;
   gap: 8px;
   padding: 10px;
   border-top: 1px solid var(--vp-border);
   background: var(--background-secondary);
+}
+
+.vaultpilot-dictation {
+  width: 38px;
+  min-width: 38px;
+  height: 38px;
+  margin-bottom: 1px;
+  padding: 8px;
+}
+
+.vaultpilot-dictation[aria-pressed="true"] {
+  color: var(--text-on-accent);
+  background: var(--interactive-accent);
 }
 
 .vaultpilot-attachment-preview {
@@ -456,6 +511,119 @@
   color: var(--text-muted);
 }
 
+.vaultpilot-memory-manager,
+.vaultpilot-audit-list {
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+  margin: 8px 0 16px;
+}
+
+.vaultpilot-memory-entry,
+.vaultpilot-audit-entry {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 9px 10px;
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 8px;
+  background: var(--background-secondary-alt);
+}
+
+.vaultpilot-memory-content,
+.vaultpilot-audit-title {
+  font-weight: 600;
+}
+
+.vaultpilot-memory-meta,
+.vaultpilot-audit-meta,
+.vaultpilot-audit-summary,
+.vaultpilot-empty-setting {
+  color: var(--text-muted);
+  font-size: var(--font-ui-smaller);
+}
+
+.vaultpilot-audit-entry {
+  display: block;
+  border-inline-start: 3px solid var(--text-success);
+}
+
+.vaultpilot-audit-entry.is-error {
+  border-inline-start-color: var(--text-error);
+}
+
+.vaultpilot-bases-view {
+  height: 100%;
+  overflow: auto;
+}
+
+.vaultpilot-priority-list {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+  gap: 10px;
+  padding: 10px;
+}
+
+.vaultpilot-priority-card {
+  padding: 10px;
+  border: 1px solid var(--vp-border, var(--background-modifier-border));
+  border-radius: 10px;
+  background: var(--background-secondary);
+}
+
+.vaultpilot-priority-open {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  width: 100%;
+  min-height: 40px;
+  color: var(--text-normal);
+  font-weight: 650;
+  text-align: start;
+}
+
+.vaultpilot-priority-properties {
+  display: grid;
+  gap: 5px;
+  margin-top: 8px;
+}
+
+.vaultpilot-priority-property {
+  display: grid;
+  grid-template-columns: minmax(80px, 0.4fr) minmax(0, 1fr);
+  gap: 7px;
+  overflow-wrap: anywhere;
+}
+
+.vaultpilot-priority-key {
+  color: var(--text-muted);
+}
+
+.vaultpilot-high-contrast {
+  --vp-border: var(--text-muted);
+}
+
+.vaultpilot-high-contrast :focus-visible {
+  outline: 3px solid var(--interactive-accent);
+  outline-offset: 2px;
+}
+
+.vaultpilot-large-targets button,
+.vaultpilot-large-targets .vaultpilot-icon-button {
+  min-width: 44px;
+  min-height: 44px;
+}
+
+.vaultpilot-reduce-motion .vaultpilot-messages {
+  scroll-behavior: auto;
+}
+
+.vaultpilot-reduce-motion .vaultpilot-tool-event.is-running svg,
+.vaultpilot-reduce-motion .vaultpilot-assistant.is-streaming::after {
+  animation: none;
+}
+
 /* Mobile ItemView: full-tab layout, touch targets, keyboard-safe composer. */
 .vaultpilot-mobile {
   width: 100%;
@@ -501,7 +669,7 @@
 .vaultpilot-mobile .vaultpilot-composer {
   position: sticky;
   bottom: 0;
-  grid-template-columns: auto minmax(0, 1fr) auto;
+  grid-template-columns: auto minmax(0, 1fr) auto auto;
   padding: 8px 8px max(8px, env(safe-area-inset-bottom));
 }
 
@@ -511,6 +679,13 @@
   height: 44px;
   padding: 10px;
   touch-action: manipulation;
+}
+
+.vaultpilot-mobile .vaultpilot-dictation {
+  width: 44px;
+  min-width: 44px;
+  height: 44px;
+  padding: 10px;
 }
 
 .vaultpilot-mobile .vaultpilot-message-images {
@@ -594,6 +769,9 @@
   .vaultpilot-header { padding-inline: 7px; }
   .vaultpilot-messages { padding-inline: 8px; }
   .vaultpilot-wide-textarea { min-width: 180px; width: 100%; }
+  .vaultpilot-quick-actions { grid-template-columns: 1fr; }
+  .vaultpilot-mobile .vaultpilot-composer { gap: 5px; }
+  .vaultpilot-mobile .vaultpilot-send { min-width: 54px; padding-inline: 8px; }
 }
 
 @media (prefers-reduced-motion: reduce) {

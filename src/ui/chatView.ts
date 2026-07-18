@@ -17,6 +17,7 @@ export interface ChatViewHost {
   getSettings(): VaultPilotSettings;
   getActiveSession(): ChatSession;
   getImageAttachmentBlob(id: string): Promise<Blob | null>;
+  insertIntoActiveNote(content: string): Promise<string>;
   sendChat(message: string, imageAttachments: ImageAttachmentInput[], callbacks: AgentCallbacks): Promise<void>;
   newChat(): void;
   archiveAllChats(): Promise<number>;
@@ -95,6 +96,11 @@ export class VaultPilotChatView extends ItemView {
     container.empty();
     container.addClass("vaultpilot-view");
     container.toggleClass("vaultpilot-mobile", Platform.isMobile);
+    const settings = this.host.getSettings();
+    container.toggleClass("vaultpilot-reduce-motion", settings.reduceMotion);
+    container.toggleClass("vaultpilot-high-contrast", settings.highContrast);
+    container.toggleClass("vaultpilot-large-targets", settings.largeTouchTargets);
+    container.style.setProperty("--vp-interface-scale", `${settings.interfaceScale / 100}`);
 
     const header = container.createDiv({ cls: "vaultpilot-header" });
     const identity = header.createDiv({ cls: "vaultpilot-identity" });
@@ -112,22 +118,22 @@ export class VaultPilotChatView extends ItemView {
     iconButton(actions, "archive", "Archive all conversations", () => void this.archiveAll());
     iconButton(actions, "settings", "Open VaultPilot settings", () => this.host.openSettings());
 
-    this.statusEl = container.createDiv({ cls: "vaultpilot-status", attr: { "aria-live": "polite" } });
+    this.statusEl = container.createDiv({ cls: "vaultpilot-status", attr: { "aria-live": settings.screenReaderAnnouncements ? "polite" : "off", role: "status" } });
     this.statusEl.hide();
-    this.messagesEl = container.createDiv({ cls: "vaultpilot-messages", attr: { role: "log", "aria-live": "polite" } });
+    this.messagesEl = container.createDiv({ cls: "vaultpilot-messages", attr: { role: "log", "aria-live": settings.screenReaderAnnouncements ? "polite" : "off", "aria-label": "VaultPilot conversation" } });
 
     const composer = container.createDiv({ cls: "vaultpilot-composer" });
     this.attachmentPreviewEl = composer.createDiv({ cls: "vaultpilot-attachment-preview" });
     this.attachmentPreviewEl.hide();
-    this.attachmentButton = iconButton(composer, "image-plus", "Attach images", () => this.attachmentInput?.click());
+    this.attachmentButton = iconButton(composer, "image-plus", Platform.isMobile ? "Attach or take a photo" : "Attach images", () => this.attachmentInput?.click());
     this.attachmentButton.addClass("vaultpilot-attach");
     this.attachmentInput = composer.createEl("input", {
       cls: "vaultpilot-file-input",
       attr: {
         type: "file",
-        accept: IMAGE_FILE_ACCEPT,
+        accept: Platform.isMobile ? "image/*" : IMAGE_FILE_ACCEPT,
         multiple: "",
-        "aria-label": "Choose images for VaultPilot OS"
+        "aria-label": Platform.isMobile ? "Choose or take images for VaultPilot OS" : "Choose images for VaultPilot OS"
       }
     });
     this.attachmentInput.addEventListener("change", () => {
@@ -145,11 +151,18 @@ export class VaultPilotChatView extends ItemView {
       }
     });
     this.inputEl.addEventListener("keydown", (event) => {
+      if (event.key === "Escape" && this.host.isChatRunning()) {
+        event.preventDefault();
+        this.denyPendingApprovals();
+        this.host.stopChat();
+        return;
+      }
       if (shouldSubmitComposerKey(event, Platform.isMobile)) {
         event.preventDefault();
         void this.submit();
       }
     });
+    if (settings.voiceInputEnabled) this.addDictationButton(composer);
     this.inputEl.addEventListener("paste", (event) => {
       const files = Array.from(event.clipboardData?.files ?? []).filter((file) => file.type.startsWith("image/"));
       if (!files.length) return;
@@ -184,12 +197,18 @@ export class VaultPilotChatView extends ItemView {
       setIcon(icon, "sparkles");
       empty.createEl("h3", { text: "Your vault, with an agent at the controls" });
       empty.createEl("p", { text: "Search notes, connect ideas, work with files, or look up current information." });
+      const quick = empty.createDiv({ cls: "vaultpilot-quick-actions", attr: { "aria-label": "Suggested actions" } });
+      const activePath = this.app.workspace.getActiveFile()?.path;
+      quickAction(quick, "Plan my day", "Review my open and overdue tasks and relevant project notes, then create a realistic prioritized plan for today.", (prompt) => void this.submitExternal(prompt));
+      quickAction(quick, "Current note summary", activePath ? `Read "${activePath}" and summarize it with key decisions and next actions.` : "Ask me to open a note, then summarize it.", (prompt) => void this.submitExternal(prompt));
+      quickAction(quick, "Refresh dashboard", "Refresh my productivity dashboard using open tasks and relevant project context.", (prompt) => void this.submitExternal(prompt));
+      quickAction(quick, "Study this note", activePath ? `Read "${activePath}" and create an accessible study plan and practice questions for it.` : "Ask me to open a note, then create a study plan.", (prompt) => void this.submitExternal(prompt));
       return;
     }
     for (const message of session.messages) {
       if (!message.content && !message.attachments?.length) continue;
       const bubble = this.createBubble(message.role);
-      if (message.role === "assistant") void this.renderMarkdown(bubble, message.content);
+      if (message.role === "assistant") void this.renderMarkdown(bubble, message.content).then(() => this.addResponseActions(bubble, message.content));
       else void this.renderUserMessage(bubble, message, generation);
     }
     this.scrollToBottom();
@@ -234,7 +253,10 @@ export class VaultPilotChatView extends ItemView {
     } finally {
       for (const attachment of submittedImages) globalThis.URL.revokeObjectURL(attachment.previewUrl);
       assistantBubble.removeClass("is-streaming");
-      if (assistantText) await this.renderMarkdown(assistantBubble, assistantText);
+      if (assistantText) {
+        await this.renderMarkdown(assistantBubble, assistantText);
+        this.addResponseActions(assistantBubble, assistantText);
+      }
       else assistantBubble.remove();
       this.setStatus(null);
       this.setRunning(false);
@@ -397,12 +419,12 @@ export class VaultPilotChatView extends ItemView {
 
   private requestApproval(container: HTMLElement, request: ToolApprovalRequest): Promise<boolean> {
     return new Promise<boolean>((resolve) => {
-      const card = container.createDiv({ cls: `vaultpilot-approval risk-${request.risk}` });
+      const card = container.createDiv({ cls: `vaultpilot-approval risk-${request.risk}`, attr: { role: "alertdialog", "aria-label": request.description } });
       const heading = card.createDiv({ cls: "vaultpilot-approval-title" });
       const icon = heading.createSpan();
-      setIcon(icon, request.risk === "write" ? "file-pen-line" : request.risk === "network" ? "globe" : "search");
+      setIcon(icon, request.risk === "write" ? "file-pen-line" : request.risk === "sync" ? "cloud" : request.risk === "network" ? "globe" : "search");
       heading.createSpan({ text: request.description });
-      card.createEl("pre", { text: JSON.stringify(request.call.args, null, 2) });
+      card.createEl("pre", { text: request.preview || JSON.stringify(request.call.args, null, 2) });
       const actions = card.createDiv({ cls: "vaultpilot-approval-actions" });
       const allow = actions.createEl("button", { text: "Allow", cls: "mod-cta" });
       const deny = actions.createEl("button", { text: "Deny" });
@@ -420,12 +442,13 @@ export class VaultPilotChatView extends ItemView {
       this.pendingApprovals.add(settle);
       allow.addEventListener("click", () => settle(true));
       deny.addEventListener("click", () => settle(false));
+      allow.focus();
       this.scrollToBottom();
     });
   }
 
   private addToolEvent(container: HTMLElement, description: string, state: "running"): void {
-    const event = container.createDiv({ cls: `vaultpilot-tool-event is-${state}` });
+    const event = container.createDiv({ cls: `vaultpilot-tool-event is-${state}`, attr: { role: "status" } });
     event.dataset.description = description;
     const icon = event.createSpan();
     setIcon(icon, "loader-circle");
@@ -450,6 +473,76 @@ export class VaultPilotChatView extends ItemView {
     const usage = this.host.getActiveSession().usage;
     this.usageEl.setText(`${formatTokens(usage.inputTokens)} in · ${formatTokens(usage.outputTokens)} out · $${usage.costUsd.toFixed(4)}`);
     this.usageEl.setAttr("title", "Session input tokens, output tokens, and approximate USD cost");
+  }
+
+  private addResponseActions(bubble: HTMLElement, content: string): void {
+    if (!content.trim() || bubble.querySelector(".vaultpilot-response-actions")) return;
+    const actions = bubble.createDiv({ cls: "vaultpilot-response-actions", attr: { role: "group", "aria-label": "Response actions" } });
+    responseAction(actions, "copy", "Copy response", async () => {
+      await this.containerEl.win.navigator.clipboard.writeText(content);
+      this.setStatus("Response copied.");
+    });
+    responseAction(actions, "file-plus-2", "Insert into active note", async () => {
+      const path = await this.host.insertIntoActiveNote(content);
+      this.setStatus(`Inserted into ${path}. Use Undo last VaultPilot change if needed.`);
+    });
+    if (this.host.getSettings().readAloudEnabled && "speechSynthesis" in this.containerEl.win) {
+      responseAction(actions, "volume-2", "Read response aloud", async () => {
+        this.containerEl.win.speechSynthesis.cancel();
+        this.containerEl.win.speechSynthesis.speak(new SpeechSynthesisUtterance(content.replace(/[`#*_\[\]]/g, " ")));
+      });
+    }
+  }
+
+  private addDictationButton(composer: HTMLElement): void {
+    type RecognitionEvent = Event & { results?: ArrayLike<{ 0?: { transcript?: string } }> };
+    type Recognition = {
+      lang: string;
+      interimResults: boolean;
+      continuous: boolean;
+      start(): void;
+      stop(): void;
+      onresult: ((event: RecognitionEvent) => void) | null;
+      onerror: (() => void) | null;
+      onend: (() => void) | null;
+    };
+    const recognitionWindow = this.containerEl.win as Window & {
+      SpeechRecognition?: new () => Recognition;
+      webkitSpeechRecognition?: new () => Recognition;
+    };
+    const Constructor = recognitionWindow.SpeechRecognition ?? recognitionWindow.webkitSpeechRecognition;
+    if (!Constructor) return;
+    const button = iconButton(composer, "mic", "Dictate message", () => {
+      if (button.getAttribute("aria-pressed") === "true") {
+        recognition.stop();
+        return;
+      }
+      button.setAttr("aria-pressed", "true");
+      this.setStatus("Listening…");
+      recognition.start();
+    });
+    button.addClass("vaultpilot-dictation");
+    button.setAttr("aria-pressed", "false");
+    const recognition = new Constructor();
+    recognition.lang = this.containerEl.doc.documentElement.lang || "en-AU";
+    recognition.interimResults = false;
+    recognition.continuous = true;
+    recognition.onresult = (event) => {
+      const transcripts: string[] = [];
+      for (let index = 0; index < (event.results?.length ?? 0); index += 1) {
+        const transcript = event.results?.[index]?.[0]?.transcript;
+        if (transcript) transcripts.push(transcript.trim());
+      }
+      if (this.inputEl && transcripts.length) {
+        this.inputEl.value = `${this.inputEl.value}${this.inputEl.value && !this.inputEl.value.endsWith(" ") ? " " : ""}${transcripts.join(" ")}`;
+      }
+    };
+    recognition.onerror = () => this.setStatus("Dictation was unavailable or permission was denied.");
+    recognition.onend = () => {
+      button.setAttr("aria-pressed", "false");
+      if (!this.host.isChatRunning()) this.setStatus(null);
+      this.inputEl?.focus();
+    };
   }
 
   private setRunning(running: boolean): void {
@@ -503,6 +596,19 @@ function iconButton(container: HTMLElement, iconName: string, label: string, onC
   setIcon(button, iconName);
   button.addEventListener("click", onClick);
   return button;
+}
+
+function quickAction(container: HTMLElement, label: string, prompt: string, run: (prompt: string) => void): void {
+  const button = container.createEl("button", { cls: "vaultpilot-quick-action", text: label });
+  button.addEventListener("click", () => run(prompt));
+}
+
+function responseAction(container: HTMLElement, iconName: string, label: string, run: () => Promise<void>): void {
+  const button = iconButton(container, iconName, label, () => {
+    button.disabled = true;
+    void run().catch(() => undefined).finally(() => { button.disabled = false; });
+  });
+  button.addClass("vaultpilot-response-action");
 }
 
 function formatTokens(value: number): string {

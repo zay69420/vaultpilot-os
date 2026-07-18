@@ -40,4 +40,19 @@ describe("SessionStore multimodal context", () => {
     expect(loaded).toEqual(["newer"]);
     expect(context.at(-1)?.parts.some((part) => part.inlineData?.data === "AQIDBA==")).toBe(true);
   });
+
+  it("attributes late background usage to the originating session", () => {
+    const store = new SessionStore(undefined, undefined, vi.fn());
+    const originalId = store.activeSessionId();
+    const message = store.addMessage("assistant", "Pending");
+    store.newSession();
+
+    store.updateMessage(message.id, "Completed", originalId);
+    store.addUsage({ inputTokens: 5, outputTokens: 2, totalTokens: 7, costUsd: 0.01 }, originalId);
+
+    const original = store.all().find((session) => session.id === originalId);
+    expect(original?.messages[0]?.content).toBe("Completed");
+    expect(original?.usage.totalTokens).toBe(7);
+    expect(store.active().usage.totalTokens).toBe(0);
+  });
 });
