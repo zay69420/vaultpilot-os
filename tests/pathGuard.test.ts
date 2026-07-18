@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { assertSafeFolder, assertSafeVaultPath, joinSafeVaultPath } from "../src/security/pathGuard";
+import { assertSafeFolder, assertSafeVaultPath, joinSafeVaultAssetPath, joinSafeVaultPath } from "../src/security/pathGuard";
 
 describe("vault path guard", () => {
   it("normalizes safe vault-relative Markdown paths", () => {
@@ -24,5 +24,12 @@ describe("vault path guard", () => {
 
   it("requires Markdown when a tool requests Markdown-only access", () => {
     expect(() => assertSafeVaultPath("notes/private.json", { markdownOnly: true })).toThrow(/Markdown/);
+  });
+
+  it("allows safe archived image assets without weakening the forbidden zone", () => {
+    expect(joinSafeVaultAssetPath("conversations", "_attachments", "session-1", "image.png"))
+      .toBe("conversations/_attachments/session-1/image.png");
+    expect(() => joinSafeVaultAssetPath(".obsidian", "plugins", "image.png")).toThrow(/forbidden/i);
+    expect(() => joinSafeVaultAssetPath("conversations", "..", ".obsidian", "image.png")).toThrow(/traversal/i);
   });
 });

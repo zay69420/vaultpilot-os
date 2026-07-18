@@ -1,6 +1,7 @@
 import { App } from "obsidian";
-import { assertSafeFolder, joinSafeVaultPath } from "../security/pathGuard";
-import type { ChatMessage, ChatSession, VaultPilotSettings } from "../types";
+import { assertSafeFolder, joinSafeVaultAssetPath, joinSafeVaultPath } from "../security/pathGuard";
+import type { ChatMessage, ChatSession, StoredImageAttachment, VaultPilotSettings } from "../types";
+import { displayImageName, extensionForImageMimeType } from "../utils/imageAttachments";
 import { formatArchiveTimestamp, sanitizeTopic } from "../utils/text";
 import { ensureFolder } from "../utils/vault";
 
@@ -10,10 +11,14 @@ export interface ArchiveResult {
 }
 
 export class ArchiveService {
-  constructor(private readonly app: App, private readonly getSettings: () => VaultPilotSettings) {}
+  constructor(
+    private readonly app: App,
+    private readonly getSettings: () => VaultPilotSettings,
+    private readonly loadAttachment: (id: string) => Promise<StoredImageAttachment | undefined>
+  ) {}
 
   async archiveAll(sessions: ChatSession[]): Promise<ArchiveResult> {
-    const candidates = sessions.filter((session) => session.messages.some((message) => message.content.trim()));
+    const candidates = sessions.filter((session) => session.messages.some((message) => message.content.trim() || message.attachments?.length));
     const sessionIds = new Set<string>();
     const paths: string[] = [];
     if (candidates.length === 0) return { sessionIds, paths };
@@ -31,18 +36,46 @@ export class ArchiveService {
         path = joinSafeVaultPath(folder, `${topic}@${timestamp}.md`);
         suffix += 1;
       }
-      await this.app.vault.create(path, renderArchive(session));
+      const attachmentPaths = await this.archiveAttachments(folder, session);
+      await this.app.vault.create(path, renderArchive(session, attachmentPaths));
       paths.push(path);
       sessionIds.add(session.id);
     }
     return { sessionIds, paths };
   }
+
+  private async archiveAttachments(folder: string, session: ChatSession): Promise<Map<string, string>> {
+    const output = new Map<string, string>();
+    const attachments = session.messages.flatMap((message) => message.attachments ?? []);
+    if (attachments.length === 0) return output;
+    const assetsFolder = joinSafeVaultAssetPath(folder, "_attachments", session.id);
+    await ensureFolder(this.app, assetsFolder);
+    for (const attachment of attachments) {
+      const stored = await this.loadAttachment(attachment.id);
+      if (!stored || stored.data.byteLength !== stored.size) continue;
+      const fallbackExtension = extensionForImageMimeType(stored.mimeType);
+      const cleanName = displayImageName(stored.name);
+      const dot = cleanName.lastIndexOf(".");
+      const stem = dot > 0 ? cleanName.slice(0, dot) : cleanName;
+      const filename = `${stem}.${fallbackExtension}`;
+      const prefix = stored.id.replace(/[^a-zA-Z0-9_-]/g, "").slice(-12) || "image";
+      let path = joinSafeVaultAssetPath(assetsFolder, `${prefix}-${filename}`);
+      let suffix = 2;
+      while (this.app.vault.getAbstractFileByPath(path)) {
+        path = joinSafeVaultAssetPath(assetsFolder, `${prefix}-${stem}-${suffix}.${fallbackExtension}`);
+        suffix += 1;
+      }
+      await this.app.vault.createBinary(path, stored.data);
+      output.set(stored.id, path);
+    }
+    return output;
+  }
 }
 
-function renderArchive(session: ChatSession): string {
+function renderArchive(session: ChatSession, attachmentPaths: Map<string, string>): string {
   const created = new Date(session.createdAt).toISOString();
   const updated = new Date(session.updatedAt).toISOString();
-  const transcript = session.messages.map(renderMessage).join("\n\n");
+  const transcript = session.messages.map((message) => renderMessage(message, attachmentPaths)).join("\n\n");
   return `---
 type: vaultpilot-conversation
 title: ${JSON.stringify(session.title)}
@@ -59,7 +92,12 @@ ${transcript}
 `;
 }
 
-function renderMessage(message: ChatMessage): string {
+function renderMessage(message: ChatMessage, attachmentPaths: Map<string, string>): string {
   const role = message.role === "user" ? "User" : "Assistant";
-  return `## ${role}\n\n${message.content}`;
+  const images = (message.attachments ?? [])
+    .map((attachment) => attachmentPaths.get(attachment.id))
+    .filter((path): path is string => Boolean(path))
+    .map((path) => `![[${path}]]`)
+    .join("\n\n");
+  return `## ${role}\n\n${[message.content, images].filter(Boolean).join("\n\n")}`;
 }

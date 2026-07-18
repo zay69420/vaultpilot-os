@@ -1,5 +1,14 @@
 import { ItemView, MarkdownRenderer, Platform, WorkspaceLeaf, setIcon } from "obsidian";
-import type { AgentCallbacks, ChatSession, ToolApprovalRequest, VaultPilotSettings } from "../types";
+import type { AgentCallbacks, ChatImageAttachment, ChatMessage, ChatSession, ImageAttachmentInput, ToolApprovalRequest, VaultPilotSettings } from "../types";
+import { createId } from "../utils/id";
+import {
+  displayImageName,
+  formatBytes,
+  IMAGE_FILE_ACCEPT,
+  imageLimits,
+  totalAttachmentBytes,
+  validateImageCandidate
+} from "../utils/imageAttachments";
 import { composerEnterKeyHint, shouldSubmitComposerKey } from "../utils/mobile";
 
 export const CHAT_VIEW_TYPE = "vaultpilot-os-chat";
@@ -7,7 +16,8 @@ export const CHAT_VIEW_TYPE = "vaultpilot-os-chat";
 export interface ChatViewHost {
   getSettings(): VaultPilotSettings;
   getActiveSession(): ChatSession;
-  sendChat(message: string, callbacks: AgentCallbacks): Promise<void>;
+  getImageAttachmentBlob(id: string): Promise<Blob | null>;
+  sendChat(message: string, imageAttachments: ImageAttachmentInput[], callbacks: AgentCallbacks): Promise<void>;
   newChat(): void;
   archiveAllChats(): Promise<number>;
   stopChat(): void;
@@ -15,12 +25,23 @@ export interface ChatViewHost {
   isChatRunning(): boolean;
 }
 
+interface PendingImageAttachment {
+  input: ImageAttachmentInput;
+  previewUrl: string;
+}
+
 export class VaultPilotChatView extends ItemView {
   private messagesEl: HTMLElement | null = null;
   private usageEl: HTMLElement | null = null;
   private statusEl: HTMLElement | null = null;
   private inputEl: HTMLTextAreaElement | null = null;
+  private attachmentButton: HTMLButtonElement | null = null;
+  private attachmentInput: HTMLInputElement | null = null;
+  private attachmentPreviewEl: HTMLElement | null = null;
   private sendButton: HTMLButtonElement | null = null;
+  private pendingImages: PendingImageAttachment[] = [];
+  private messagePreviewUrls = new Set<string>();
+  private renderGeneration = 0;
   private pendingApprovals = new Set<(allowed: boolean) => void>();
 
   constructor(leaf: WorkspaceLeaf, private readonly host: ChatViewHost) {
@@ -46,12 +67,15 @@ export class VaultPilotChatView extends ItemView {
   async onClose(): Promise<void> {
     for (const resolve of this.pendingApprovals) resolve(false);
     this.pendingApprovals.clear();
+    this.clearPendingImages();
+    this.releaseMessagePreviews();
   }
 
   refresh(): void {
     this.renderMessages();
     this.renderUsage();
     this.setRunning(this.host.isChatRunning());
+    this.syncAttachmentAvailability();
   }
 
   focusInput(): void {
@@ -59,11 +83,14 @@ export class VaultPilotChatView extends ItemView {
   }
 
   async submitExternal(prompt: string): Promise<void> {
+    this.clearPendingImages();
     if (this.inputEl) this.inputEl.value = prompt;
     await this.submit();
   }
 
   private renderShell(): void {
+    this.clearPendingImages();
+    this.releaseMessagePreviews();
     const container = this.containerEl.children[1] as HTMLElement;
     container.empty();
     container.addClass("vaultpilot-view");
@@ -90,6 +117,24 @@ export class VaultPilotChatView extends ItemView {
     this.messagesEl = container.createDiv({ cls: "vaultpilot-messages", attr: { role: "log", "aria-live": "polite" } });
 
     const composer = container.createDiv({ cls: "vaultpilot-composer" });
+    this.attachmentPreviewEl = composer.createDiv({ cls: "vaultpilot-attachment-preview" });
+    this.attachmentPreviewEl.hide();
+    this.attachmentButton = iconButton(composer, "image-plus", "Attach images", () => this.attachmentInput?.click());
+    this.attachmentButton.addClass("vaultpilot-attach");
+    this.attachmentInput = composer.createEl("input", {
+      cls: "vaultpilot-file-input",
+      attr: {
+        type: "file",
+        accept: IMAGE_FILE_ACCEPT,
+        multiple: "",
+        "aria-label": "Choose images for VaultPilot OS"
+      }
+    });
+    this.attachmentInput.addEventListener("change", () => {
+      const files = Array.from(this.attachmentInput?.files ?? []);
+      if (this.attachmentInput) this.attachmentInput.value = "";
+      void this.addImageFiles(files);
+    });
     this.inputEl = composer.createEl("textarea", {
       cls: "vaultpilot-input",
       attr: {
@@ -105,6 +150,12 @@ export class VaultPilotChatView extends ItemView {
         void this.submit();
       }
     });
+    this.inputEl.addEventListener("paste", (event) => {
+      const files = Array.from(event.clipboardData?.files ?? []).filter((file) => file.type.startsWith("image/"));
+      if (!files.length) return;
+      event.preventDefault();
+      void this.addImageFiles(files);
+    });
     this.sendButton = composer.createEl("button", { cls: "vaultpilot-send mod-cta", text: "Send" });
     this.sendButton.addEventListener("click", () => {
       if (this.host.isChatRunning()) {
@@ -117,10 +168,14 @@ export class VaultPilotChatView extends ItemView {
     this.renderMessages();
     this.renderUsage();
     this.setRunning(this.host.isChatRunning());
+    this.syncAttachmentAvailability();
   }
 
   private renderMessages(): void {
     if (!this.messagesEl) return;
+    this.renderGeneration += 1;
+    const generation = this.renderGeneration;
+    this.releaseMessagePreviews();
     this.messagesEl.empty();
     const session = this.host.getActiveSession();
     if (session.messages.length === 0) {
@@ -132,20 +187,24 @@ export class VaultPilotChatView extends ItemView {
       return;
     }
     for (const message of session.messages) {
-      if (!message.content) continue;
+      if (!message.content && !message.attachments?.length) continue;
       const bubble = this.createBubble(message.role);
       if (message.role === "assistant") void this.renderMarkdown(bubble, message.content);
-      else bubble.setText(message.content);
+      else void this.renderUserMessage(bubble, message, generation);
     }
     this.scrollToBottom();
   }
 
   private async submit(): Promise<void> {
     const value = this.inputEl?.value.trim() ?? "";
-    if (!value || this.host.isChatRunning() || !this.messagesEl) return;
+    if ((!value && this.pendingImages.length === 0) || this.host.isChatRunning() || !this.messagesEl) return;
+    const submittedImages = this.pendingImages;
+    this.pendingImages = [];
+    const displayValue = value || "Analyze the attached image or images.";
     if (this.inputEl) this.inputEl.value = "";
+    this.renderAttachmentPreview();
     if (this.messagesEl.querySelector(".vaultpilot-empty")) this.messagesEl.empty();
-    this.createBubble("user").setText(value);
+    this.renderPendingUserMessage(this.createBubble("user"), displayValue, submittedImages);
     const assistantBubble = this.createBubble("assistant");
     assistantBubble.addClass("is-streaming");
     const events = this.messagesEl.createDiv({ cls: "vaultpilot-tool-events" });
@@ -169,19 +228,158 @@ export class VaultPilotChatView extends ItemView {
     };
 
     try {
-      await this.host.sendChat(value, callbacks);
+      await this.host.sendChat(value, submittedImages.map((attachment) => attachment.input), callbacks);
     } catch (error) {
       if (!assistantText) assistantText = error instanceof Error ? error.message : String(error);
     } finally {
+      for (const attachment of submittedImages) globalThis.URL.revokeObjectURL(attachment.previewUrl);
       assistantBubble.removeClass("is-streaming");
       if (assistantText) await this.renderMarkdown(assistantBubble, assistantText);
       else assistantBubble.remove();
       this.setStatus(null);
       this.setRunning(false);
       this.renderUsage();
-      this.scrollToBottom();
+      this.renderMessages();
       if (!Platform.isMobile) this.inputEl?.focus();
     }
+  }
+
+  private async renderUserMessage(element: HTMLElement, message: ChatMessage, generation: number): Promise<void> {
+    element.empty();
+    if (message.attachments?.length) {
+      const gallery = element.createDiv({ cls: "vaultpilot-message-images" });
+      for (const attachment of message.attachments) {
+        const item = this.createImageTile(gallery, attachment);
+        try {
+          const blob = await this.host.getImageAttachmentBlob(attachment.id);
+          if (!blob || generation !== this.renderGeneration || !item.isConnected) continue;
+          const url = globalThis.URL.createObjectURL(blob);
+          this.messagePreviewUrls.add(url);
+          this.setTileImage(item, url, attachment.name);
+        } catch {
+          item.addClass("is-unavailable");
+        }
+      }
+    }
+    if (message.content) element.createDiv({ cls: "vaultpilot-user-text", text: message.content });
+  }
+
+  private renderPendingUserMessage(element: HTMLElement, content: string, attachments: PendingImageAttachment[]): void {
+    if (attachments.length) {
+      const gallery = element.createDiv({ cls: "vaultpilot-message-images" });
+      for (const attachment of attachments) {
+        const item = this.createImageTile(gallery, attachment.input);
+        this.setTileImage(item, attachment.previewUrl, attachment.input.name);
+      }
+    }
+    if (content) element.createDiv({ cls: "vaultpilot-user-text", text: content });
+  }
+
+  private createImageTile(container: HTMLElement, attachment: ChatImageAttachment): HTMLElement {
+    const item = container.createDiv({ cls: "vaultpilot-image-tile", attr: { title: `${attachment.name} · ${formatBytes(attachment.size)}` } });
+    const fallback = item.createDiv({ cls: "vaultpilot-image-fallback" });
+    setIcon(fallback, "image");
+    item.createDiv({ cls: "vaultpilot-image-name", text: attachment.name });
+    return item;
+  }
+
+  private setTileImage(item: HTMLElement, url: string, name: string): void {
+    const fallback = item.querySelector<HTMLElement>(".vaultpilot-image-fallback");
+    const image = item.createEl("img", { cls: "vaultpilot-image-thumbnail", attr: { src: url, alt: name } });
+    image.addEventListener("load", () => fallback?.hide(), { once: true });
+    image.addEventListener("error", () => {
+      image.hide();
+      fallback?.show();
+      item.addClass("is-unavailable");
+    }, { once: true });
+  }
+
+  private async addImageFiles(files: File[]): Promise<void> {
+    const settings = this.host.getSettings();
+    if (!settings.imageUploadsEnabled) {
+      this.setStatus("Image uploads are disabled in settings.");
+      return;
+    }
+    const limits = imageLimits(settings.maxImagesPerMessage, settings.maxImageSizeMb, settings.maxImageRequestMb);
+    let count = this.pendingImages.length;
+    let bytes = totalAttachmentBytes(this.pendingImages.map((attachment) => attachment.input));
+    let lastError = "";
+    for (const file of files) {
+      try {
+        const mimeType = validateImageCandidate(file, count, bytes, limits);
+        const data = await file.arrayBuffer();
+        if (data.byteLength !== file.size) throw new Error(`${displayImageName(file.name)} could not be read completely.`);
+        const input: ImageAttachmentInput = {
+          id: createId("image"),
+          name: displayImageName(file.name),
+          mimeType,
+          size: file.size,
+          data
+        };
+        this.pendingImages.push({ input, previewUrl: globalThis.URL.createObjectURL(file) });
+        count += 1;
+        bytes += file.size;
+      } catch (error) {
+        lastError = error instanceof Error ? error.message : String(error);
+      }
+    }
+    this.renderAttachmentPreview();
+    this.setStatus(lastError || (this.pendingImages.length ? `${this.pendingImages.length} image${this.pendingImages.length === 1 ? "" : "s"} ready.` : null));
+    if (!lastError && this.pendingImages.length) {
+      this.containerEl.win.setTimeout(() => {
+        if (!this.host.isChatRunning()) this.setStatus(null);
+      }, 1800);
+    }
+  }
+
+  private renderAttachmentPreview(): void {
+    if (!this.attachmentPreviewEl) return;
+    this.attachmentPreviewEl.empty();
+    this.attachmentPreviewEl.toggle(this.pendingImages.length > 0);
+    for (const pending of this.pendingImages) {
+      const card = this.attachmentPreviewEl.createDiv({ cls: "vaultpilot-pending-image" });
+      const image = card.createEl("img", {
+        attr: { src: pending.previewUrl, alt: pending.input.name },
+        cls: "vaultpilot-pending-thumbnail"
+      });
+      image.addEventListener("error", () => image.addClass("is-unavailable"), { once: true });
+      const details = card.createDiv({ cls: "vaultpilot-pending-details" });
+      details.createDiv({ cls: "vaultpilot-pending-name", text: pending.input.name });
+      details.createDiv({ cls: "vaultpilot-pending-size", text: formatBytes(pending.input.size) });
+      const remove = card.createEl("button", {
+        cls: "clickable-icon vaultpilot-remove-image",
+        attr: { "aria-label": `Remove ${pending.input.name}`, title: `Remove ${pending.input.name}` }
+      });
+      setIcon(remove, "x");
+      remove.disabled = this.host.isChatRunning();
+      remove.addEventListener("click", () => this.removePendingImage(pending.input.id));
+    }
+  }
+
+  private removePendingImage(id: string): void {
+    const pending = this.pendingImages.find((attachment) => attachment.input.id === id);
+    if (pending) globalThis.URL.revokeObjectURL(pending.previewUrl);
+    this.pendingImages = this.pendingImages.filter((attachment) => attachment.input.id !== id);
+    this.renderAttachmentPreview();
+    if (this.pendingImages.length === 0) this.setStatus(null);
+  }
+
+  private clearPendingImages(): void {
+    for (const attachment of this.pendingImages) globalThis.URL.revokeObjectURL(attachment.previewUrl);
+    this.pendingImages = [];
+    this.renderAttachmentPreview();
+  }
+
+  private releaseMessagePreviews(): void {
+    for (const url of this.messagePreviewUrls) globalThis.URL.revokeObjectURL(url);
+    this.messagePreviewUrls.clear();
+  }
+
+  private syncAttachmentAvailability(): void {
+    const enabled = this.host.getSettings().imageUploadsEnabled;
+    this.attachmentButton?.toggle(enabled);
+    if (this.attachmentInput) this.attachmentInput.disabled = !enabled || this.host.isChatRunning();
+    if (!enabled && this.pendingImages.length) this.clearPendingImages();
   }
 
   private createBubble(role: "user" | "assistant"): HTMLElement {
@@ -256,11 +454,14 @@ export class VaultPilotChatView extends ItemView {
 
   private setRunning(running: boolean): void {
     if (this.inputEl) this.inputEl.disabled = running;
+    if (this.attachmentButton) this.attachmentButton.disabled = running;
+    if (this.attachmentInput) this.attachmentInput.disabled = running || !this.host.getSettings().imageUploadsEnabled;
     if (this.sendButton) {
       this.sendButton.disabled = false;
       this.sendButton.setText(running ? "Stop" : "Send");
       this.sendButton.toggleClass("mod-warning", running);
     }
+    this.renderAttachmentPreview();
   }
 
   private setStatus(value: string | null): void {

@@ -9,10 +9,12 @@ import { MemoryService } from "./services/memoryService";
 import { obsidianGeminiTransport } from "./services/obsidianTransport";
 import { SearchService } from "./services/searchService";
 import { ToolRegistry } from "./services/toolRegistry";
+import { AttachmentStore } from "./storage/attachmentStore";
 import { SessionStore } from "./storage/sessionStore";
 import { VectorStore } from "./storage/vectorStore";
-import type { AgentCallbacks, ChatSession, CustomCommand, PersistedData, VaultPilotSettings } from "./types";
+import type { AgentCallbacks, ChatMessage, ChatSession, CustomCommand, ImageAttachmentInput, PersistedData, VaultPilotSettings } from "./types";
 import { createId } from "./utils/id";
+import { imageLimits, validateImageCandidate } from "./utils/imageAttachments";
 import { CHAT_VIEW_TYPE, VaultPilotChatView, type ChatViewHost } from "./ui/chatView";
 import { VaultPilotSettingTab, type SettingsHost } from "./ui/settingsTab";
 
@@ -21,6 +23,7 @@ export default class VaultPilotPlugin extends Plugin implements ChatViewHost, Se
   private sessions!: SessionStore;
   private gemini!: GeminiClient;
   private vectors!: VectorStore;
+  private attachments!: AttachmentStore;
   private indexer!: IndexService;
   private memory!: MemoryService;
   private agent!: AgentService;
@@ -47,8 +50,11 @@ export default class VaultPilotPlugin extends Plugin implements ChatViewHost, Se
     this.sessions = new SessionStore(stored?.sessions, stored?.activeSessionId, () => this.scheduleSave());
     startupStage = "opening local vector storage";
     this.gemini = new GeminiClient(() => this.config, obsidianGeminiTransport);
-    this.vectors = new VectorStore(`${this.app.vault.getName()}:${this.vaultId}`);
-    await this.vectors.open();
+    const vaultIdentifier = `${this.app.vault.getName()}:${this.vaultId}`;
+    this.vectors = new VectorStore(vaultIdentifier);
+    this.attachments = new AttachmentStore(vaultIdentifier);
+    await Promise.all([this.vectors.open(), this.attachments.open()]);
+    await this.attachments.prune(this.sessions.allAttachmentIds());
     startupStage = "creating services";
     this.indexer = new IndexService(this.app, this.vectors, this.gemini, () => this.config);
     const search = new SearchService(this.app, this.vectors, this.gemini, () => this.config);
@@ -59,9 +65,13 @@ export default class VaultPilotPlugin extends Plugin implements ChatViewHost, Se
       this.memory,
       tools,
       () => this.config,
-      () => this.sessions.context(this.config.conversationHistoryLimit)
+      () => this.sessions.context(
+        this.config.conversationHistoryLimit,
+        (id) => this.attachments.get(id),
+        this.config.maxImageRequestMb * 1024 * 1024
+      )
     );
-    this.archive = new ArchiveService(this.app, () => this.config);
+    this.archive = new ArchiveService(this.app, () => this.config, (id) => this.attachments.get(id));
 
     startupStage = "registering the Obsidian interface";
     this.registerView(CHAT_VIEW_TYPE, (leaf) => new VaultPilotChatView(leaf, this));
@@ -94,6 +104,7 @@ export default class VaultPilotPlugin extends Plugin implements ChatViewHost, Se
     if (this.saveHandle !== null) window.clearTimeout(this.saveHandle);
     void this.persistNow();
     this.indexer?.dispose();
+    this.attachments?.close();
     this.app.workspace.detachLeavesOfType(CHAT_VIEW_TYPE);
   }
 
@@ -103,6 +114,12 @@ export default class VaultPilotPlugin extends Plugin implements ChatViewHost, Se
 
   getActiveSession(): ChatSession {
     return this.sessions.active();
+  }
+
+  async getImageAttachmentBlob(id: string): Promise<Blob | null> {
+    const attachment = await this.attachments.get(id);
+    if (!attachment || attachment.data.byteLength !== attachment.size) return null;
+    return new Blob([attachment.data], { type: attachment.mimeType });
   }
 
   isChatRunning(): boolean {
@@ -138,35 +155,47 @@ export default class VaultPilotPlugin extends Plugin implements ChatViewHost, Se
     });
   }
 
-  async sendChat(message: string, callbacks: AgentCallbacks): Promise<void> {
+  async sendChat(message: string, imageAttachments: ImageAttachmentInput[], callbacks: AgentCallbacks): Promise<void> {
     if (this.activeController) throw new Error("A VaultPilot response is already running.");
-    this.sessions.addMessage("user", message);
-    const assistant = this.sessions.addMessage("assistant", "");
-    this.activeController = new AbortController();
+    const normalizedMessage = message.trim() || (imageAttachments.length ? "Analyze the attached image or images." : "");
+    if (!normalizedMessage) throw new Error("Enter a message or attach an image first.");
+    if (imageAttachments.length && !this.config.imageUploadsEnabled) throw new Error("Image uploads are disabled in VaultPilot settings.");
+    this.validateImageAttachments(imageAttachments);
+    const controller = new AbortController();
+    this.activeController = controller;
+    let assistant: ChatMessage | null = null;
     let response = "";
-    const wrapped: AgentCallbacks = {
-      ...callbacks,
-      onText: (delta) => {
-        response += delta;
-        this.sessions.updateMessage(assistant.id, response);
-        callbacks.onText(delta);
-      },
-      onUsage: (usage) => {
-        this.sessions.addUsage(usage);
-        this.updateStatusBar();
-        callbacks.onUsage(usage);
-      }
-    };
 
     try {
-      await this.agent.run(message, wrapped, this.activeController.signal);
+      const storedAttachments = await this.attachments.saveMany(imageAttachments);
+      this.sessions.addMessage("user", normalizedMessage, storedAttachments);
+      assistant = this.sessions.addMessage("assistant", "");
+      const assistantId = assistant.id;
+      const wrapped: AgentCallbacks = {
+        ...callbacks,
+        onText: (delta) => {
+          response += delta;
+          this.sessions.updateMessage(assistantId, response);
+          callbacks.onText(delta);
+        },
+        onUsage: (usage) => {
+          this.sessions.addUsage(usage);
+          this.updateStatusBar();
+          callbacks.onUsage(usage);
+        }
+      };
+      await this.agent.run(normalizedMessage, wrapped, controller.signal);
       if (!response.trim()) {
         response = "No response was returned.";
-        this.sessions.updateMessage(assistant.id, response);
+        this.sessions.updateMessage(assistantId, response);
         callbacks.onText(response);
       }
     } catch (error) {
-      const stopped = this.activeController.signal.aborted || (error instanceof DOMException && error.name === "AbortError");
+      if (!assistant) {
+        await this.attachments.deleteMany(imageAttachments.map((attachment) => attachment.id)).catch(() => undefined);
+        throw error;
+      }
+      const stopped = controller.signal.aborted || (error instanceof DOMException && error.name === "AbortError");
       if (!response.trim()) {
         response = stopped ? "Stopped." : `Error: ${errorMessage(error)}`;
         this.sessions.updateMessage(assistant.id, response);
@@ -194,11 +223,33 @@ export default class VaultPilotPlugin extends Plugin implements ChatViewHost, Se
   async archiveAllChats(): Promise<number> {
     if (this.activeController) throw new Error("Stop the current response before archiving.");
     const result = await this.archive.archiveAll(this.sessions.all());
+    const attachmentIds = this.sessions.attachmentIdsForSessions(result.sessionIds);
     this.sessions.removeSessions(result.sessionIds);
+    await this.attachments.deleteMany(attachmentIds);
     this.updateStatusBar();
     this.refreshViews();
     this.scheduleSave();
     return result.paths.length;
+  }
+
+  private validateImageAttachments(attachments: ImageAttachmentInput[]): void {
+    const limits = imageLimits(this.config.maxImagesPerMessage, this.config.maxImageSizeMb, this.config.maxImageRequestMb);
+    const ids = new Set<string>();
+    let totalBytes = 0;
+    for (const attachment of attachments) {
+      if (!attachment.id || ids.has(attachment.id)) throw new Error("An image attachment has an invalid identifier.");
+      const mimeType = validateImageCandidate(
+        { name: attachment.name, type: attachment.mimeType, size: attachment.size },
+        ids.size,
+        totalBytes,
+        limits
+      );
+      if (mimeType !== attachment.mimeType || attachment.data.byteLength !== attachment.size) {
+        throw new Error(`${attachment.name} changed while it was being attached. Select it again.`);
+      }
+      ids.add(attachment.id);
+      totalBytes += attachment.size;
+    }
   }
 
   openSettings(): void {

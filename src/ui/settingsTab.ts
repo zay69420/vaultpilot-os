@@ -50,6 +50,17 @@ export class VaultPilotSettingTab extends PluginSettingTab {
     textSetting(containerEl, "Chat model", "Gemini model used for agent turns.", settings.model, (model) => this.host.updateSettings({ model }));
     textSetting(containerEl, "Embedding model", "Model used to build and query the local vector index.", settings.embeddingModel, (embeddingModel) => this.host.updateSettings({ embeddingModel }));
 
+    new Setting(containerEl).setName("Image attachments").setHeading();
+    new Setting(containerEl)
+      .setName("Enable image uploads")
+      .setDesc("Adds a desktop/mobile image picker to chat. Images are stored in local IndexedDB and sent only to Gemini with the message that needs them.")
+      .addToggle((toggle) => toggle
+        .setValue(settings.imageUploadsEnabled)
+        .onChange(async (imageUploadsEnabled) => this.host.updateSettings({ imageUploadsEnabled })));
+    numberSetting(containerEl, "Images per message", "Maximum number of PNG, JPEG, WebP, HEIC, or HEIF attachments in one message.", settings.maxImagesPerMessage, 1, 8, 1, (maxImagesPerMessage) => this.host.updateSettings({ maxImagesPerMessage }));
+    numberSetting(containerEl, "Per-image limit (MB)", "Rejects unusually large images before reading or storing them.", settings.maxImageSizeMb, 1, 12, 1, (maxImageSizeMb) => this.host.updateSettings({ maxImageSizeMb }));
+    numberSetting(containerEl, "Image request budget (MB)", "Caps raw image bytes retained in a Gemini request so base64 data plus prompts stay below the inline request limit.", settings.maxImageRequestMb, 1, 12, 1, (maxImageRequestMb) => this.host.updateSettings({ maxImageRequestMb }));
+
     new Setting(containerEl).setName("Agent behavior").setHeading();
     new Setting(containerEl)
       .setName("Tool execution")

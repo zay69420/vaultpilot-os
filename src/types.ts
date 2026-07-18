@@ -19,6 +19,10 @@ export interface VaultPilotSettings {
   showStatusBarCost: boolean;
   inputPricePerMillion: number;
   outputPricePerMillion: number;
+  imageUploadsEnabled: boolean;
+  maxImagesPerMessage: number;
+  maxImageSizeMb: number;
+  maxImageRequestMb: number;
   autoIndexOnStartup: boolean;
   indexOnFileChange: boolean;
   embeddingDimensions: number;
@@ -48,11 +52,30 @@ export interface TokenUsage {
 
 export type ChatRole = "user" | "assistant";
 
+export type SupportedImageMimeType = "image/png" | "image/jpeg" | "image/webp" | "image/heic" | "image/heif";
+
+export interface ChatImageAttachment {
+  id: string;
+  name: string;
+  mimeType: SupportedImageMimeType;
+  size: number;
+}
+
+export interface ImageAttachmentInput extends ChatImageAttachment {
+  data: ArrayBuffer;
+}
+
+export interface StoredImageAttachment extends ChatImageAttachment {
+  data: ArrayBuffer;
+  createdAt: number;
+}
+
 export interface ChatMessage {
   id: string;
   role: ChatRole;
   content: string;
   createdAt: number;
+  attachments?: ChatImageAttachment[];
 }
 
 export interface ChatSession {
@@ -85,6 +108,10 @@ export interface GeminiFunctionResponse {
 
 export interface GeminiPart {
   text?: string;
+  inlineData?: {
+    mimeType: string;
+    data: string;
+  };
   thought?: boolean;
   thoughtSignature?: string;
   functionCall?: GeminiFunctionCall;

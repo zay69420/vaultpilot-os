@@ -23,6 +23,10 @@ export const DEFAULT_SETTINGS: VaultPilotSettings = {
   showStatusBarCost: true,
   inputPricePerMillion: 1.5,
   outputPricePerMillion: 9,
+  imageUploadsEnabled: true,
+  maxImagesPerMessage: 4,
+  maxImageSizeMb: 6,
+  maxImageRequestMb: 12,
   autoIndexOnStartup: true,
   indexOnFileChange: true,
   embeddingDimensions: 768,
@@ -66,8 +70,11 @@ export function mergeSettings(value: Partial<VaultPilotSettings> | null | undefi
   merged.maxChunksPerFile = clampInteger(merged.maxChunksPerFile, 1, 1000);
   merged.searchResultLimit = clampInteger(merged.searchResultLimit, 1, 30);
   merged.conversationHistoryLimit = clampInteger(merged.conversationHistoryLimit, 0, 20);
+  merged.maxImagesPerMessage = clampInteger(merged.maxImagesPerMessage, 1, 8);
   merged.temperature = clampNumber(merged.temperature, 0, 2);
   merged.memoryThreshold = clampNumber(merged.memoryThreshold, 0, 1);
+  merged.maxImageRequestMb = clampNumber(merged.maxImageRequestMb, 1, 12);
+  merged.maxImageSizeMb = Math.min(merged.maxImageRequestMb, clampNumber(merged.maxImageSizeMb, 1, 12));
   merged.inputPricePerMillion = Math.max(0, Number(merged.inputPricePerMillion) || 0);
   merged.outputPricePerMillion = Math.max(0, Number(merged.outputPricePerMillion) || 0);
   return merged;

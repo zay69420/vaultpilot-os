@@ -1,7 +1,7 @@
 {
   "name": "vaultpilot-os",
-  "version": "1.1.0",
-  "description": "A local-first autonomous Gemini assistant for Obsidian vaults.",
+  "version": "1.2.0",
+  "description": "A local-first multimodal Gemini assistant for Obsidian vaults.",
   "author": "zay69420",
   "repository": {
     "type": "git",
@@ -29,6 +29,7 @@
   "devDependencies": {
     "@types/node": "^22.15.17",
     "esbuild": "^0.25.5",
+    "fake-indexeddb": "^6.2.5",
     "obsidian": "latest",
     "typescript": "^5.8.3",
     "vitest": "^3.2.4"

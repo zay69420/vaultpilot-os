@@ -51,6 +51,10 @@ export function joinSafeVaultPath(folder: string, filename: string): string {
   return assertSafeVaultPath(`${assertSafeFolder(folder)}/${filename}`, { markdownOnly: true });
 }
 
+export function joinSafeVaultAssetPath(folder: string, ...segments: string[]): string {
+  return assertSafeVaultPath([assertSafeFolder(folder), ...segments].join("/"));
+}
+
 export function isForbiddenVaultPath(input: string): boolean {
   try {
     assertSafeVaultPath(input, { allowRoot: true });

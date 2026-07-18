@@ -9,13 +9,13 @@ export class AgentService {
     private readonly memory: MemoryService,
     private readonly tools: ToolRegistry,
     private readonly getSettings: () => VaultPilotSettings,
-    private readonly getConversationContext: () => GeminiContent[]
+    private readonly getConversationContext: () => Promise<GeminiContent[]>
   ) {}
 
   async run(userMessage: string, callbacks: AgentCallbacks, signal?: AbortSignal): Promise<string> {
     const settings = this.getSettings();
     let visibleText = "";
-    let contents = this.getConversationContext();
+    let contents = await this.getConversationContext();
 
     if (settings.memoryEnabled && settings.memoryInterceptEnabled) {
       callbacks.onMemoryStatus?.("Reviewing long-term memory…");
