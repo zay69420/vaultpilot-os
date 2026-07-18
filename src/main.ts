@@ -1,0 +1,368 @@
+import { MarkdownView, Notice, Platform, Plugin, TFile, WorkspaceLeaf } from "obsidian";
+import { isForbiddenVaultPath } from "./security/pathGuard";
+import { DEFAULT_SETTINGS, mergeSettings } from "./settings/defaults";
+import { AgentService } from "./services/agentService";
+import { ArchiveService } from "./services/archiveService";
+import { GeminiClient } from "./services/geminiClient";
+import { IndexService } from "./services/indexService";
+import { MemoryService } from "./services/memoryService";
+import { obsidianGeminiTransport } from "./services/obsidianTransport";
+import { SearchService } from "./services/searchService";
+import { ToolRegistry } from "./services/toolRegistry";
+import { SessionStore } from "./storage/sessionStore";
+import { VectorStore } from "./storage/vectorStore";
+import type { AgentCallbacks, ChatSession, CustomCommand, PersistedData, VaultPilotSettings } from "./types";
+import { createId } from "./utils/id";
+import { CHAT_VIEW_TYPE, VaultPilotChatView, type ChatViewHost } from "./ui/chatView";
+import { VaultPilotSettingTab, type SettingsHost } from "./ui/settingsTab";
+
+export default class VaultPilotPlugin extends Plugin implements ChatViewHost, SettingsHost {
+  private config: VaultPilotSettings = { ...DEFAULT_SETTINGS };
+  private sessions!: SessionStore;
+  private gemini!: GeminiClient;
+  private vectors!: VectorStore;
+  private indexer!: IndexService;
+  private memory!: MemoryService;
+  private agent!: AgentService;
+  private archive!: ArchiveService;
+  private activeController: AbortController | null = null;
+  private statusBarEl: HTMLElement | null = null;
+  private saveHandle: number | null = null;
+  private registeredCustomCommandIds = new Set<string>();
+  private vaultId = "";
+
+  async onload(): Promise<void> {
+    let startupStage = "loading saved data";
+    try {
+    const stored = (await this.loadData()) as Partial<PersistedData> | null;
+    this.config = mergeSettings(stored?.settings);
+    const legacyApiKey = this.config.apiKey.trim();
+    const secretId = this.config.apiKeySecretId.trim() || DEFAULT_SETTINGS.apiKeySecretId;
+    if (legacyApiKey && !this.app.secretStorage.getSecret(secretId)) {
+      this.app.secretStorage.setSecret(secretId, legacyApiKey);
+    }
+    this.config.apiKeySecretId = secretId;
+    this.config.apiKey = this.app.secretStorage.getSecret(secretId) ?? "";
+    this.vaultId = stored?.vaultId?.trim() || createId("vault");
+    this.sessions = new SessionStore(stored?.sessions, stored?.activeSessionId, () => this.scheduleSave());
+    startupStage = "opening local vector storage";
+    this.gemini = new GeminiClient(() => this.config, obsidianGeminiTransport);
+    this.vectors = new VectorStore(`${this.app.vault.getName()}:${this.vaultId}`);
+    await this.vectors.open();
+    startupStage = "creating services";
+    this.indexer = new IndexService(this.app, this.vectors, this.gemini, () => this.config);
+    const search = new SearchService(this.app, this.vectors, this.gemini, () => this.config);
+    const tools = new ToolRegistry(this.app, search, () => this.config);
+    this.memory = new MemoryService(this.app, this.gemini, () => this.config);
+    this.agent = new AgentService(
+      this.gemini,
+      this.memory,
+      tools,
+      () => this.config,
+      () => this.sessions.context(this.config.conversationHistoryLimit)
+    );
+    this.archive = new ArchiveService(this.app, () => this.config);
+
+    startupStage = "registering the Obsidian interface";
+    this.registerView(CHAT_VIEW_TYPE, (leaf) => new VaultPilotChatView(leaf, this));
+    this.addRibbonIcon("bot", "Open VaultPilot OS", () => void this.activateChat());
+    if (!Platform.isMobile) {
+      this.statusBarEl = this.addStatusBarItem();
+      this.statusBarEl.addClass("vaultpilot-statusbar");
+      this.statusBarEl.addEventListener("click", () => void this.activateChat());
+    }
+    this.addSettingTab(new VaultPilotSettingTab(this));
+    this.registerCoreCommands();
+    this.registerCustomCommands();
+    this.registerVaultEvents();
+    this.updateStatusBar();
+    this.scheduleSave();
+
+    startupStage = "scheduling workspace initialization";
+    this.app.workspace.onLayoutReady(() => {
+      void this.initializeAfterLayout();
+    });
+    } catch (error) {
+      console.error(`VaultPilot OS startup failed during ${startupStage}`, error);
+      new Notice(`VaultPilot OS startup failed during ${startupStage}: ${errorMessage(error)}`, 30_000);
+      throw error;
+    }
+  }
+
+  onunload(): void {
+    this.activeController?.abort();
+    if (this.saveHandle !== null) window.clearTimeout(this.saveHandle);
+    void this.persistNow();
+    this.indexer?.dispose();
+    this.app.workspace.detachLeavesOfType(CHAT_VIEW_TYPE);
+  }
+
+  getSettings(): VaultPilotSettings {
+    return this.config;
+  }
+
+  getActiveSession(): ChatSession {
+    return this.sessions.active();
+  }
+
+  isChatRunning(): boolean {
+    return this.activeController !== null;
+  }
+
+  async updateSettings(patch: Partial<VaultPilotSettings>): Promise<void> {
+    this.config = mergeSettings({ ...this.config, ...patch });
+    if (patch.apiKeySecretId !== undefined) {
+      this.config.apiKey = this.app.secretStorage.getSecret(this.config.apiKeySecretId) ?? "";
+    }
+    this.registerCustomCommands();
+    this.updateStatusBar();
+    this.scheduleSave();
+    if (patch.memoryEnabled === true || patch.memoryFolder !== undefined) {
+      await this.memory.initialize().catch((error) => new Notice(errorMessage(error), 7000));
+    }
+  }
+
+  async testGeminiConnection(): Promise<string> {
+    return this.gemini.testConnection();
+  }
+
+  async rebuildSearchIndex(): Promise<void> {
+    if (!this.config.apiKey.trim()) throw new Error("Add a Gemini API key before rebuilding the index.");
+    let lastNoticeAt = 0;
+    await this.indexer.rebuild((progress) => {
+      const now = Date.now();
+      if (progress.total > 0 && now - lastNoticeAt > 5000) {
+        lastNoticeAt = now;
+        new Notice(`VaultPilot indexing ${progress.completed}/${progress.total}: ${progress.currentPath ?? ""}`, 2500);
+      }
+    });
+  }
+
+  async sendChat(message: string, callbacks: AgentCallbacks): Promise<void> {
+    if (this.activeController) throw new Error("A VaultPilot response is already running.");
+    this.sessions.addMessage("user", message);
+    const assistant = this.sessions.addMessage("assistant", "");
+    this.activeController = new AbortController();
+    let response = "";
+    const wrapped: AgentCallbacks = {
+      ...callbacks,
+      onText: (delta) => {
+        response += delta;
+        this.sessions.updateMessage(assistant.id, response);
+        callbacks.onText(delta);
+      },
+      onUsage: (usage) => {
+        this.sessions.addUsage(usage);
+        this.updateStatusBar();
+        callbacks.onUsage(usage);
+      }
+    };
+
+    try {
+      await this.agent.run(message, wrapped, this.activeController.signal);
+      if (!response.trim()) {
+        response = "No response was returned.";
+        this.sessions.updateMessage(assistant.id, response);
+        callbacks.onText(response);
+      }
+    } catch (error) {
+      const stopped = this.activeController.signal.aborted || (error instanceof DOMException && error.name === "AbortError");
+      if (!response.trim()) {
+        response = stopped ? "Stopped." : `Error: ${errorMessage(error)}`;
+        this.sessions.updateMessage(assistant.id, response);
+        callbacks.onText(response);
+      }
+      if (!stopped) throw error;
+    } finally {
+      this.activeController = null;
+      this.updateStatusBar();
+      this.scheduleSave();
+    }
+  }
+
+  stopChat(): void {
+    this.activeController?.abort();
+  }
+
+  newChat(): void {
+    if (this.activeController) return;
+    this.sessions.newSession();
+    this.updateStatusBar();
+    this.refreshViews();
+  }
+
+  async archiveAllChats(): Promise<number> {
+    if (this.activeController) throw new Error("Stop the current response before archiving.");
+    const result = await this.archive.archiveAll(this.sessions.all());
+    this.sessions.removeSessions(result.sessionIds);
+    this.updateStatusBar();
+    this.refreshViews();
+    this.scheduleSave();
+    return result.paths.length;
+  }
+
+  openSettings(): void {
+    const appWithSettings = this.app as typeof this.app & {
+      setting: { open(): void; openTabById(id: string): void };
+    };
+    appWithSettings.setting.open();
+    appWithSettings.setting.openTabById(this.manifest.id);
+  }
+
+  private async initializeAfterLayout(): Promise<void> {
+    await this.memory.initialize().catch((error) => console.warn("VaultPilot OS memory initialization failed", error));
+    if (this.config.autoIndexOnStartup && this.config.apiKey.trim()) {
+      await this.indexer.indexChangedFiles(undefined).catch((error) => {
+        console.error("VaultPilot OS startup indexing failed", error);
+        new Notice(`VaultPilot indexing paused: ${errorMessage(error)}`, 8000);
+      });
+    }
+  }
+
+  private registerCoreCommands(): void {
+    this.addCommand({
+      id: "open-chat",
+      name: "Open chat",
+      callback: () => void this.activateChat()
+    });
+    this.addCommand({
+      id: "open-settings",
+      name: "Open settings",
+      callback: () => this.openSettings()
+    });
+    this.addCommand({
+      id: "new-chat",
+      name: "Start new conversation",
+      callback: () => {
+        this.newChat();
+        void this.activateChat();
+      }
+    });
+    this.addCommand({
+      id: "archive-all-chats",
+      name: "Archive all conversations",
+      callback: () => void this.archiveAllChats().then((count) => new Notice(count ? `Archived ${count} conversation${count === 1 ? "" : "s"}.` : "No conversations to archive."))
+    });
+    this.addCommand({
+      id: "rebuild-vector-index",
+      name: "Rebuild local vector index",
+      callback: () => void this.rebuildSearchIndex().then(() => new Notice("VaultPilot OS index rebuilt.")).catch((error) => new Notice(errorMessage(error), 8000))
+    });
+  }
+
+  private registerCustomCommands(): void {
+    for (const command of this.config.customCommands) {
+      const id = `custom-${safeCommandId(command.id)}`;
+      if (!command.name.trim() || !command.prompt.trim() || this.registeredCustomCommandIds.has(id)) continue;
+      this.registeredCustomCommandIds.add(id);
+      this.addCommand({
+        id,
+        name: command.name,
+        callback: () => void this.runCustomCommand(command.id)
+      });
+    }
+  }
+
+  private async runCustomCommand(commandId: string): Promise<void> {
+    const command = this.config.customCommands.find((candidate) => candidate.id === commandId);
+    if (!command) {
+      new Notice("That VaultPilot custom command no longer exists. Reload the plugin to refresh the Command Palette.");
+      return;
+    }
+    const activeFile = this.app.workspace.getActiveFile();
+    let currentNote = "";
+    let currentNotePath = "";
+    if (activeFile && !isForbiddenVaultPath(activeFile.path)) {
+      currentNotePath = activeFile.path;
+      currentNote = await this.app.vault.cachedRead(activeFile);
+    }
+    const selection = this.app.workspace.getActiveViewOfType(MarkdownView)?.editor.getSelection() ?? "";
+    const prompt = expandCommand(command, { currentNote, currentNotePath, selection });
+    const view = await this.activateChat();
+    await view.submitExternal(prompt);
+  }
+
+  private registerVaultEvents(): void {
+    this.registerEvent(this.app.vault.on("create", (file) => {
+      if (file instanceof TFile && file.extension.toLocaleLowerCase() === "md") this.indexer.scheduleFile(file);
+    }));
+    this.registerEvent(this.app.vault.on("modify", (file) => {
+      if (file instanceof TFile && file.extension.toLocaleLowerCase() === "md") this.indexer.scheduleFile(file);
+    }));
+    this.registerEvent(this.app.vault.on("delete", (file) => this.indexer.scheduleFile(file.path)));
+    this.registerEvent(this.app.vault.on("rename", (file, oldPath) => {
+      this.indexer.scheduleFile(oldPath);
+      if (file instanceof TFile && file.extension.toLocaleLowerCase() === "md") this.indexer.scheduleFile(file);
+    }));
+  }
+
+  private async activateChat(): Promise<VaultPilotChatView> {
+    let leaf = this.app.workspace.getLeavesOfType(CHAT_VIEW_TYPE)[0];
+    if (!leaf) {
+      leaf = Platform.isMobile
+        ? this.app.workspace.getLeaf("tab")
+        : this.app.workspace.getRightLeaf(false) ?? this.app.workspace.getLeaf(true);
+      await leaf.setViewState({ type: CHAT_VIEW_TYPE, active: true });
+    }
+    await this.app.workspace.revealLeaf(leaf);
+    if (Platform.isMobile) this.app.workspace.setActiveLeaf(leaf, { focus: false });
+    const view = leaf.view;
+    if (!(view instanceof VaultPilotChatView)) throw new Error("Could not open the VaultPilot OS chat view.");
+    view.refresh();
+    if (!Platform.isMobile) view.focusInput();
+    return view;
+  }
+
+  private refreshViews(): void {
+    for (const leaf of this.app.workspace.getLeavesOfType(CHAT_VIEW_TYPE)) {
+      if (leaf.view instanceof VaultPilotChatView) leaf.view.refresh();
+    }
+  }
+
+  private updateStatusBar(): void {
+    if (Platform.isMobile || !this.statusBarEl) return;
+    this.statusBarEl.toggle(this.config.showStatusBarCost);
+    if (!this.config.showStatusBarCost) return;
+    const usage = this.sessions.active().usage;
+    this.statusBarEl.setText(`VaultPilot $${usage.costUsd.toFixed(4)}`);
+    this.statusBarEl.setAttr("aria-label", "Open VaultPilot OS chat");
+    this.statusBarEl.setAttr("title", `${usage.inputTokens} input · ${usage.outputTokens} output tokens`);
+  }
+
+  private scheduleSave(): void {
+    if (this.saveHandle !== null) window.clearTimeout(this.saveHandle);
+    this.saveHandle = window.setTimeout(() => {
+      this.saveHandle = null;
+      void this.persistNow();
+    }, 250);
+  }
+
+  private async persistNow(): Promise<void> {
+    if (!this.sessions) return;
+    const data: PersistedData = {
+      settings: { ...this.config, apiKey: "" },
+      sessions: this.sessions.all(),
+      activeSessionId: this.sessions.activeSessionId(),
+      vaultId: this.vaultId
+    };
+    await this.saveData(data);
+  }
+}
+
+function expandCommand(
+  command: CustomCommand,
+  values: { currentNote: string; currentNotePath: string; selection: string }
+): string {
+  return command.prompt
+    .replaceAll("{{currentNote}}", values.currentNote)
+    .replaceAll("{{currentNotePath}}", values.currentNotePath)
+    .replaceAll("{{selection}}", values.selection);
+}
+
+function safeCommandId(value: string): string {
+  return value.toLocaleLowerCase().replace(/[^a-z0-9-]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 80) || "command";
+}
+
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}

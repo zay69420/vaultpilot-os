@@ -1,0 +1,11 @@
+node_modules/
+main.js
+*.map
+.DS_Store
+work/
+outputs/
+.agents/
+.codex/
+data.json
+.env
+.env.*

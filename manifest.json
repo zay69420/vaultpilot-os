@@ -1,0 +1,10 @@
+{
+  "id": "vaultpilot-os",
+  "name": "VaultPilot OS",
+  "version": "1.1.0",
+  "minAppVersion": "1.11.4",
+  "description": "A local-first autonomous Gemini assistant with agent tools, scalable memory, and graph-boosted vault search.",
+  "author": "zay69420",
+  "authorUrl": "https://github.com/zay69420",
+  "isDesktopOnly": false
+}
