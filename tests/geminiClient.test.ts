@@ -35,6 +35,54 @@ describe("GeminiClient authentication", () => {
     expect(transport).toHaveBeenCalledOnce();
   });
 
+  it("uses the buffered generateContent endpoint when streaming is disabled for mobile", async () => {
+    const deltas: string[] = [];
+    const transport = vi.fn(async (url: string) => {
+      expect(url).toContain(":generateContent");
+      expect(url).not.toContain(":streamGenerateContent");
+      return new Response(JSON.stringify({
+        candidates: [{ content: { role: "model", parts: [{ text: "Mobile response" }] } }],
+        usageMetadata: { promptTokenCount: 2, candidatesTokenCount: 2, totalTokenCount: 4 }
+      }), { status: 200, headers: { "Content-Type": "application/json" } });
+    });
+    const client = new GeminiClient(
+      () => ({ ...DEFAULT_SETTINGS, apiKey: "AQ.mobile-generation-test-key" }),
+      transport,
+      { streaming: false }
+    );
+
+    await expect(client.generateTurn({
+      contents: [{ role: "user", parts: [{ text: "Hello" }] }],
+      systemInstruction: "Be concise.",
+      onText: (delta) => deltas.push(delta)
+    })).resolves.toMatchObject({ text: "Mobile response" });
+
+    expect(deltas).toEqual(["Mobile response"]);
+    expect(transport).toHaveBeenCalledOnce();
+  });
+
+  it("falls back to generateContent when a buffered SSE response contains no events", async () => {
+    const transport = vi.fn(async (url: string) => {
+      if (url.includes(":streamGenerateContent")) {
+        return new Response("", { status: 200, headers: { "Content-Type": "text/event-stream" } });
+      }
+      return new Response(JSON.stringify({
+        candidates: [{ content: { role: "model", parts: [{ text: "Recovered response" }] } }]
+      }), { status: 200, headers: { "Content-Type": "application/json" } });
+    });
+    const client = new GeminiClient(
+      () => ({ ...DEFAULT_SETTINGS, apiKey: "AQ.empty-stream-test-key" }),
+      transport
+    );
+
+    await expect(client.generateTurn({
+      contents: [{ role: "user", parts: [{ text: "Hello" }] }],
+      systemInstruction: "Be concise."
+    })).resolves.toMatchObject({ text: "Recovered response" });
+
+    expect(transport).toHaveBeenCalledTimes(2);
+  });
+
   it("sends image parts to Gemini as inlineData without rewriting the payload", async () => {
     let requestBody: Record<string, unknown> | undefined;
     const transport = vi.fn(async (_url: string, init: RequestInit) => {

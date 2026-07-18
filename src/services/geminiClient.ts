@@ -12,6 +12,15 @@ const GEMINI_API_ROOT = "https://generativelanguage.googleapis.com/v1beta";
 
 export type GeminiTransport = (url: string, init: RequestInit) => Promise<Response>;
 
+export interface GeminiClientOptions {
+  /**
+   * Obsidian's native requestUrl bridge buffers the complete response. Mobile
+   * WebViews are especially inconsistent when that buffered payload is wrapped
+   * as an SSE ReadableStream, so mobile callers should use generateContent.
+   */
+  streaming?: boolean;
+}
+
 interface GenerateOptions {
   contents: GeminiContent[];
   systemInstruction: string;
@@ -33,7 +42,8 @@ interface GeminiChunk {
 export class GeminiClient {
   constructor(
     private readonly getSettings: () => VaultPilotSettings,
-    private readonly transport: GeminiTransport
+    private readonly transport: GeminiTransport,
+    private readonly clientOptions: GeminiClientOptions = {}
   ) {}
 
   async testConnection(): Promise<string> {
@@ -50,6 +60,8 @@ export class GeminiClient {
 
   async generateTurn(options: GenerateOptions): Promise<GeminiTurnResult> {
     const settings = this.requireSettings();
+    if (this.clientOptions.streaming === false) return this.generateTurnWithoutStreaming(options);
+
     const body = this.createGenerateBody(options, settings);
     const response = await this.request(options.model ?? settings.model, "streamGenerateContent?alt=sse", body, options.signal);
     if (!response.body) return this.generateTurnWithoutStreaming(options);
@@ -66,7 +78,12 @@ export class GeminiClient {
       }
     }, options.signal);
 
-    return this.turnResult(parts, usageMetadata, settings);
+    const result = this.turnResult(parts, usageMetadata, settings);
+    if (hasUsableTurn(result)) return result;
+
+    // A buffered native response can expose a body while yielding no SSE data
+    // on some WebViews. Retry once through Gemini's ordinary JSON endpoint.
+    return this.generateTurnWithoutStreaming(options);
   }
 
   async generateJson<T>(options: {
@@ -151,7 +168,11 @@ export class GeminiClient {
     const parts = data.candidates?.[0]?.content?.parts ?? [];
     const publicText = parts.filter((part) => !part.thought).map((part) => part.text ?? "").join("");
     if (publicText) options.onText?.(publicText);
-    return this.turnResult(parts, data.usageMetadata ?? {}, settings);
+    const result = this.turnResult(parts, data.usageMetadata ?? {}, settings);
+    if (!hasUsableTurn(result)) {
+      throw new Error("Gemini completed the request but returned neither response text nor a tool call.");
+    }
+    return result;
   }
 
   private createGenerateBody(options: GenerateOptions, settings: VaultPilotSettings): Record<string, unknown> {
@@ -260,6 +281,10 @@ export class GeminiClient {
       throw new Error("Gemini returned an unreadable streaming response.");
     }
   }
+}
+
+function hasUsableTurn(result: GeminiTurnResult): boolean {
+  return Boolean(result.text.trim() || result.functionCalls.length);
 }
 
 function stripJsonFence(value: string): string {

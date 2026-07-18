@@ -57,7 +57,11 @@ export default class VaultPilotPlugin extends Plugin implements ChatViewHost, Se
     this.vaultId = stored?.vaultId?.trim() || createId("vault");
     this.sessions = new SessionStore(stored?.sessions, stored?.activeSessionId, () => this.scheduleSave());
     startupStage = "opening local vector storage";
-    this.gemini = new GeminiClient(() => this.config, obsidianGeminiTransport);
+    this.gemini = new GeminiClient(
+      () => this.config,
+      obsidianGeminiTransport,
+      { streaming: !Platform.isMobile }
+    );
     const vaultIdentifier = `${this.app.vault.getName()}:${this.vaultId}`;
     this.vectors = new VectorStore(vaultIdentifier);
     this.attachments = new AttachmentStore(vaultIdentifier);

@@ -140,6 +140,11 @@ export class AgentService {
       }
     });
     callbacks.onUsage(finalTurn.usage);
+    if (!visibleText.trim()) {
+      const fallback = "Gemini completed the request without displayable text. Please retry once or choose another Gemini model in settings.";
+      callbacks.onText(fallback);
+      visibleText = fallback;
+    }
     return visibleText;
   }
 }

@@ -7,7 +7,7 @@ There is no VaultPilot subscription, hosted proxy, or middle-man service.
 ## Highlights
 
 - Native desktop sidebar and full-tab mobile `ItemView` chat
-- Mobile-safe Gemini networking through Obsidian's native request bridge
+- Mobile-safe Gemini networking through Obsidian's native request bridge, using buffered JSON responses on iOS and Android instead of SSE
 - Touch-sized controls, safe-area padding, virtual-keyboard-aware composing, camera/photo selection, and optional dictation
 - Desktop/mobile image picker with previews, paste support, and Gemini multimodal analysis
 - Native Gemini function-calling agent loop with configurable step limit
@@ -35,7 +35,7 @@ There is no VaultPilot subscription, hosted proxy, or middle-man service.
 
 The install-ready folder contains `manifest.json`, `main.js`, and `styles.css`.
 
-VaultPilot 1.3.0 requires Obsidian 1.11.4 or newer so Gemini credentials can use Obsidian SecretStorage and the current Bases API.
+VaultPilot 1.3.1 requires Obsidian 1.11.4 or newer so Gemini credentials can use Obsidian SecretStorage and the current Bases API.
 
 ### Obsidian mobile
 
@@ -46,7 +46,7 @@ The same package supports iOS and Android; there is no separate reduced feature 
 3. Open **Settings > VaultPilot OS**, add the Gemini key on that device if it was not synced, and use **Test connection**.
 4. Open the robot ribbon action or run **VaultPilot OS: Open chat**. Mobile opens chat as a full workspace tab instead of a narrow sidebar.
 
-On-screen Enter inserts a newline on mobile; tap **Send** to submit. A connected hardware keyboard can submit with Ctrl+Enter or Cmd+Enter. The image button opens the native iOS/Android photo or camera chooser. Session cost remains in the chat header because Obsidian mobile has no bottom status bar. Mobile indexing can be disabled independently to save battery while retaining the existing local index.
+On-screen Enter inserts a newline on mobile; tap **Send** to submit. A connected hardware keyboard can submit with Ctrl+Enter or Cmd+Enter. The image button opens the native iOS/Android photo or camera chooser. Session cost remains in the chat header because Obsidian mobile has no bottom status bar. Mobile indexing can be disabled independently to save battery while retaining the existing local index. Version 1.3.1 also routes mobile chat through Gemini's non-streaming JSON endpoint to avoid empty responses caused by buffered SSE handling in mobile WebViews.
 
 ### Build from source
 
