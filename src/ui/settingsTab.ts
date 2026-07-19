@@ -1,5 +1,5 @@
 import { Notice, Platform, Plugin, PluginSettingTab, SecretComponent, Setting } from "obsidian";
-import type { CustomCommand, IntegrationStatus, MemoryEntry, ToolAuditEntry, ToolPolicy, VaultPilotSettings } from "../types";
+import type { CustomCommand, DiagnosticEntry, IntegrationStatus, MemoryEntry, ToolAuditEntry, ToolPolicy, VaultPilotSettings } from "../types";
 import { createId } from "../utils/id";
 
 export interface SettingsHost {
@@ -13,6 +13,10 @@ export interface SettingsHost {
   forgetMemory(category: MemoryEntry["category"], key: string): Promise<boolean>;
   clearToolAudit(): void;
   undoLatestToolChange(): Promise<string>;
+  getDiagnosticEntries(): DiagnosticEntry[];
+  getDiagnosticsPath(): string;
+  clearDiagnostics(): Promise<void>;
+  exportDiagnostics(): Promise<string>;
 }
 
 export class VaultPilotSettingTab extends PluginSettingTab {
@@ -232,6 +236,33 @@ export class VaultPilotSettingTab extends PluginSettingTab {
       this.display();
     }));
 
+    new Setting(containerEl).setName("Privacy-safe diagnostics").setHeading();
+    containerEl.createEl("p", {
+      cls: "setting-item-description",
+      text: "VaultPilot keeps up to 300 local operational events for troubleshooting. It records timing, status codes, retry counts, Gemini finish reasons, token counts, and tool-call counts—not prompts, note contents, response bodies, tool arguments, images, headers, or API keys. The hidden log remains inaccessible to AI tools."
+    });
+    containerEl.createEl("p", {
+      cls: "setting-item-description",
+      text: `Local log: ${this.host.getDiagnosticsPath()}`
+    });
+    const diagnostics = containerEl.createDiv({ cls: "vaultpilot-audit-list" });
+    this.renderDiagnostics(diagnostics);
+    new Setting(containerEl)
+      .addButton((button) => button.setButtonText("Export diagnostic log").onClick(async () => {
+        button.setDisabled(true).setButtonText("Exporting…");
+        try {
+          new Notice(`VaultPilot diagnostics exported to ${await this.host.exportDiagnostics()}`);
+        } catch (error) {
+          new Notice(errorMessage(error), 8000);
+        } finally {
+          button.setDisabled(false).setButtonText("Export diagnostic log");
+        }
+      }))
+      .addButton((button) => button.setButtonText("Clear diagnostic log").setWarning().onClick(async () => {
+        await this.host.clearDiagnostics();
+        this.display();
+      }));
+
     new Setting(containerEl).setName("Permanent security boundary").setHeading();
     const security = containerEl.createDiv({ cls: "vaultpilot-security-note" });
     security.createEl("strong", { text: ".obsidian is always forbidden to the AI." });
@@ -304,6 +335,25 @@ export class VaultPilotSettingTab extends PluginSettingTab {
         text: `${entry.source} · ${entry.risk} · ${entry.ok ? "completed" : "blocked/failed"} · ${new Date(entry.createdAt).toLocaleString()}`
       });
       row.createDiv({ cls: "vaultpilot-audit-summary", text: entry.summary });
+    }
+  }
+
+  private renderDiagnostics(container: HTMLElement): void {
+    const entries = this.host.getDiagnosticEntries();
+    if (!entries.length) {
+      container.createEl("p", { cls: "vaultpilot-empty-setting", text: "No diagnostic events recorded yet." });
+      return;
+    }
+    for (const entry of entries.slice(0, 20)) {
+      const row = container.createDiv({ cls: `vaultpilot-audit-entry ${entry.level === "error" ? "is-error" : "is-ok"}` });
+      row.createDiv({ cls: "vaultpilot-audit-title", text: `${entry.area}: ${entry.event}` });
+      row.createDiv({
+        cls: "vaultpilot-audit-meta",
+        text: `${entry.level} · ${entry.platform} · ${new Date(entry.timestamp).toLocaleString()}`
+      });
+      if (entry.details && Object.keys(entry.details).length) {
+        row.createDiv({ cls: "vaultpilot-audit-summary", text: JSON.stringify(entry.details) });
+      }
     }
   }
 

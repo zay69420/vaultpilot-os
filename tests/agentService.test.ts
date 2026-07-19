@@ -21,7 +21,7 @@ function callbacks(text: string[]): AgentCallbacks {
 describe("AgentService resilience", () => {
   afterEach(() => vi.useRealTimers());
 
-  it("automatically recovers when a final turn unexpectedly emits another tool call", async () => {
+  it("automatically recovers when a final turn contains no displayable text", async () => {
     const turns: GeminiTurnResult[] = [
       {
         content: { role: "model", parts: [{ functionCall: { id: "call-1", name: "vault_search", args: { query: "test" } } }] },
@@ -30,9 +30,9 @@ describe("AgentService resilience", () => {
         usage: usage()
       },
       {
-        content: { role: "model", parts: [{ functionCall: { id: "call-2", name: "vault_search", args: { query: "again" } } }] },
+        content: { role: "model", parts: [] },
         text: "",
-        functionCalls: [{ id: "call-2", name: "vault_search", args: { query: "again" } }],
+        functionCalls: [],
         usage: usage()
       },
       {
@@ -78,6 +78,8 @@ describe("AgentService resilience", () => {
     await expect(service.run("Find it", callbacks(text))).resolves.toBe("Recovered final answer");
     expect(text.join("")).toBe("Recovered final answer");
     expect(gemini.generateTurn).toHaveBeenCalledTimes(3);
+    expect(vi.mocked(gemini.generateTurn).mock.calls[1]?.[0]).toMatchObject({ toolMode: "NONE" });
+    expect(vi.mocked(gemini.generateTurn).mock.calls[2]?.[0]).toMatchObject({ toolMode: "NONE" });
   });
 
   it("defers background memory extraction until after the mobile response", async () => {

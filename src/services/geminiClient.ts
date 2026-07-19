@@ -1,4 +1,5 @@
 import type {
+  DiagnosticReporter,
   FunctionDeclaration,
   GeminiContent,
   GeminiPart,
@@ -7,6 +8,7 @@ import type {
   TokenUsage,
   VaultPilotSettings
 } from "../types";
+import { diagnosticErrorKind } from "../utils/diagnostics";
 
 const GEMINI_API_ROOT = "https://generativelanguage.googleapis.com/v1beta";
 
@@ -29,6 +31,8 @@ export interface GeminiClientOptions {
   thinkingLevel?: "minimal" | "low" | "medium" | "high";
   /** Optional per-turn output cap for constrained clients. */
   maxOutputTokens?: number;
+  /** Receives metadata-only diagnostics. Prompts and response bodies are excluded. */
+  diagnostics?: DiagnosticReporter;
 }
 
 interface GenerateOptions {
@@ -38,6 +42,7 @@ interface GenerateOptions {
   model?: string;
   signal?: AbortSignal;
   onText?: (delta: string) => void;
+  toolMode?: "AUTO" | "NONE";
 }
 
 interface GeminiChunk {
@@ -48,6 +53,8 @@ interface GeminiChunk {
   }>;
   usageMetadata?: GeminiUsageMetadata;
   promptFeedback?: { blockReason?: string };
+  responseId?: string;
+  modelVersion?: string;
   error?: { message?: string; code?: number; status?: string };
 }
 
@@ -93,6 +100,10 @@ export class GeminiClient {
     }, options.signal);
 
     const result = this.turnResult(parts, usageMetadata, settings);
+    this.reportGeneration(options.model ?? settings.model, "stream_turn", {
+      candidates: [{ content: { role: "model", parts } }],
+      usageMetadata
+    });
     if (hasUsableTurn(result)) return result;
 
     // A buffered native response can expose a body while yielding no SSE data
@@ -117,6 +128,7 @@ export class GeminiClient {
     };
     const response = await this.request(options.model ?? settings.model, "generateContent", body, options.signal);
     const data = (await response.json()) as GeminiChunk;
+    this.reportGeneration(options.model ?? settings.model, "structured_generation", data);
     const parts = data.candidates?.[0]?.content?.parts ?? [];
     const text = parts.filter((part) => !part.thought).map((part) => part.text ?? "").join("");
     try {
@@ -178,6 +190,7 @@ export class GeminiClient {
       options.signal
     );
     const data = (await response.json()) as GeminiChunk;
+    this.reportGeneration(options.model ?? settings.model, "buffered_turn", data);
     const parts = data.candidates?.[0]?.content?.parts ?? [];
     const publicText = parts.filter((part) => !part.thought).map((part) => part.text ?? "").join("");
     if (publicText) options.onText?.(publicText);
@@ -193,6 +206,9 @@ export class GeminiClient {
       contents: options.contents,
       systemInstruction: { parts: [{ text: options.systemInstruction }] },
       ...(options.tools?.length ? { tools: [{ functionDeclarations: options.tools }] } : {}),
+      ...(options.toolMode && options.tools?.length
+        ? { toolConfig: { functionCallingConfig: { mode: options.toolMode } } }
+        : {}),
       generationConfig: this.createGenerationConfig(options.model ?? settings.model, settings)
     };
   }
@@ -266,23 +282,69 @@ export class GeminiClient {
 
     for (let attempt = 0; attempt <= maxRetries; attempt += 1) {
       assertNotAborted(signal);
+      const startedAt = Date.now();
       let response: Response;
       try {
         response = await this.transport(url, requestInit);
       } catch (error) {
-        if (signal?.aborted) throw new DOMException("The request was stopped.", "AbortError");
+        if (signal?.aborted) {
+          this.diagnose("info", "request_aborted", { method, model, attempt: attempt + 1, durationMs: Date.now() - startedAt });
+          throw new DOMException("The request was stopped.", "AbortError");
+        }
         if (attempt < maxRetries) {
+          this.diagnose("warning", "transport_retry", {
+            method,
+            model,
+            attempt: attempt + 1,
+            maxAttempts: maxRetries + 1,
+            durationMs: Date.now() - startedAt,
+            errorKind: diagnosticErrorKind(error)
+          });
           await this.waitBeforeRetry(attempt, undefined, signal);
           continue;
         }
+        this.diagnose("error", "transport_failed", {
+          method,
+          model,
+          attempts: attempt + 1,
+          durationMs: Date.now() - startedAt,
+          errorKind: diagnosticErrorKind(error)
+        });
         throw new Error(`Could not reach the Gemini API after ${attempt + 1} ${attempt === 0 ? "attempt" : "attempts"}: ${errorMessage(error)}`);
       }
-      if (response.ok) return response;
+      if (response.ok) {
+        if (/generateContent|countTokens/i.test(method)) {
+          this.diagnose("info", "request_succeeded", {
+            method,
+            model,
+            attempt: attempt + 1,
+            status: response.status,
+            durationMs: Date.now() - startedAt
+          });
+        }
+        return response;
+      }
       if (isRetryableStatus(response.status) && attempt < maxRetries) {
+        this.diagnose("warning", "api_retry", {
+          method,
+          model,
+          attempt: attempt + 1,
+          maxAttempts: maxRetries + 1,
+          status: response.status,
+          durationMs: Date.now() - startedAt
+        });
         await this.waitBeforeRetry(attempt, response.headers.get("Retry-After") ?? undefined, signal);
         continue;
       }
       const message = await readApiError(response);
+      this.diagnose("error", "api_failed", {
+        method,
+        model,
+        attempts: attempt + 1,
+        status: response.status,
+        durationMs: Date.now() - startedAt,
+        errorKind: diagnosticErrorKind(new Error(`Gemini API error (${response.status})`))
+      });
       throw new Error(`Gemini API error (${response.status}): ${message}`);
     }
     throw new Error("Could not reach the Gemini API after retrying.");
@@ -320,6 +382,32 @@ export class GeminiClient {
       if (acquired) release();
       else void predecessor.then(release);
     }
+  }
+
+  private reportGeneration(modelInput: string, operation: string, data: GeminiChunk): void {
+    const candidate = data.candidates?.[0];
+    const parts = candidate?.content?.parts ?? [];
+    const textChars = parts.filter((part) => !part.thought).reduce((total, part) => total + (part.text?.length ?? 0), 0);
+    const functionCalls = parts.filter((part) => Boolean(part.functionCall)).length;
+    this.diagnose(textChars > 0 || functionCalls > 0 ? "info" : "warning", "generation_response", {
+      operation,
+      model: modelInput.replace(/^models\//, ""),
+      finishReason: candidate?.finishReason ?? "unspecified",
+      promptBlockReason: data.promptFeedback?.blockReason ?? "",
+      responseId: data.responseId ?? "",
+      modelVersion: data.modelVersion ?? "",
+      parts: parts.length,
+      textChars,
+      thoughtParts: parts.filter((part) => part.thought).length,
+      functionCalls,
+      inputTokens: data.usageMetadata?.promptTokenCount ?? 0,
+      outputTokens: (data.usageMetadata?.candidatesTokenCount ?? 0) + (data.usageMetadata?.thoughtsTokenCount ?? 0),
+      totalTokens: data.usageMetadata?.totalTokenCount ?? 0
+    });
+  }
+
+  private diagnose(level: "info" | "warning" | "error", event: string, details: Record<string, string | number | boolean | null>): void {
+    this.clientOptions.diagnostics?.({ level, area: "gemini", event, details });
   }
 
   private async consumeSse(

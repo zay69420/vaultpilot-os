@@ -152,6 +152,33 @@ describe("GeminiClient authentication", () => {
     expect(requestBody?.generationConfig).not.toHaveProperty("temperature");
   });
 
+  it("can force a final agent turn into text-only function-calling mode", async () => {
+    let requestBody: Record<string, unknown> | undefined;
+    const transport = vi.fn(async (_url: string, init: RequestInit) => {
+      requestBody = JSON.parse(String(init.body)) as Record<string, unknown>;
+      return new Response(JSON.stringify({
+        candidates: [{ content: { role: "model", parts: [{ text: "Final answer" }] } }]
+      }), { status: 200 });
+    });
+    const client = new GeminiClient(
+      () => ({ ...DEFAULT_SETTINGS, apiKey: "AQ.text-only-test-key" }),
+      transport,
+      { streaming: false }
+    );
+
+    await client.generateTurn({
+      contents: [{ role: "user", parts: [{ text: "Finish the answer" }] }],
+      systemInstruction: "Return the final answer.",
+      tools: [{ name: "vault_search", description: "Search the vault", parameters: {} }],
+      toolMode: "NONE"
+    });
+
+    expect(requestBody).toMatchObject({
+      tools: [{ functionDeclarations: [{ name: "vault_search" }] }],
+      toolConfig: { functionCallingConfig: { mode: "NONE" } }
+    });
+  });
+
   it("serializes mobile Gemini traffic so background work cannot compete with chat", async () => {
     let releaseFirst!: () => void;
     let signalFirstStarted!: () => void;

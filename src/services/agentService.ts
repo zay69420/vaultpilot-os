@@ -1,4 +1,4 @@
-import type { AgentCallbacks, GeminiContent, GeminiPart, TokenUsage, VaultPilotSettings } from "../types";
+import type { AgentCallbacks, DiagnosticReporter, GeminiContent, GeminiPart, TokenUsage, VaultPilotSettings } from "../types";
 import { GeminiClient } from "./geminiClient";
 import { MemoryService } from "./memoryService";
 import { ToolRegistry } from "./toolRegistry";
@@ -6,6 +6,7 @@ import { ToolRegistry } from "./toolRegistry";
 export interface AgentServiceOptions {
   /** Delays non-blocking memory extraction until the interactive response is complete. */
   deferBackgroundMemoryMs?: number;
+  diagnostics?: DiagnosticReporter;
 }
 
 export class AgentService {
@@ -71,6 +72,11 @@ export class AgentService {
           visibleText += delta;
           callbacks.onText(delta);
         }
+      });
+      this.diagnose(turn.text.trim() || turn.functionCalls.length ? "info" : "warning", "agent_turn", {
+        step: step + 1,
+        textChars: turn.text.length,
+        functionCalls: turn.functionCalls.length
       });
       callbacks.onUsage(turn.usage);
       contents = [...contents, turn.content];
@@ -148,12 +154,20 @@ export class AgentService {
         }
       }
       contents = [...contents, { role: "user", parts: responseParts }];
+      this.diagnose("info", "tool_exchange", {
+        step: step + 1,
+        calls: turn.functionCalls.length,
+        responses: responseParts.length,
+        missingCallIds: turn.functionCalls.filter((call) => !call.id).length
+      });
       if (forceFinalResponse) break;
     }
 
     const finalTurn = await this.gemini.generateTurn({
       contents,
       systemInstruction: `${systemInstruction}\n\nThe tool-step limit has been reached. Give the user the best concise answer possible from the available results without requesting more tools.`,
+      tools: declarations,
+      toolMode: "NONE",
       signal,
       onText: (delta) => {
         visibleText += delta;
@@ -161,10 +175,16 @@ export class AgentService {
       }
     });
     callbacks.onUsage(finalTurn.usage);
-    if (!visibleText.trim() && finalTurn.functionCalls.length > 0) {
+    if (!visibleText.trim()) {
+      this.diagnose("warning", "final_text_recovery", {
+        firstFunctionCalls: finalTurn.functionCalls.length,
+        firstTextChars: finalTurn.text.length
+      });
       const recoveryTurn = await this.gemini.generateTurn({
         contents,
         systemInstruction: `${systemInstruction}\n\nTools are unavailable for this final turn. Do not emit a function call. Return the best direct text answer you can from the tool results already present.`,
+        tools: declarations,
+        toolMode: "NONE",
         signal,
         onText: (delta) => {
           visibleText += delta;
@@ -172,13 +192,22 @@ export class AgentService {
         }
       });
       callbacks.onUsage(recoveryTurn.usage);
+      this.diagnose(recoveryTurn.text.trim() ? "info" : "warning", "final_text_recovery_result", {
+        textChars: recoveryTurn.text.length,
+        functionCalls: recoveryTurn.functionCalls.length
+      });
     }
     if (!visibleText.trim()) {
       const fallback = "Gemini finished without text after an automatic recovery attempt. Retry once; VaultPilot will preserve this conversation.";
+      this.diagnose("error", "final_text_missing", { agentSteps: settings.maxAgentSteps });
       callbacks.onText(fallback);
       visibleText = fallback;
     }
     return complete(visibleText);
+  }
+
+  private diagnose(level: "info" | "warning" | "error", event: string, details: Record<string, string | number | boolean | null>): void {
+    this.options.diagnostics?.({ level, area: "agent", event, details });
   }
 }
 

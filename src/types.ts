@@ -86,6 +86,23 @@ export interface TokenUsage {
   costUsd: number;
 }
 
+export type DiagnosticLevel = "info" | "warning" | "error";
+export type DiagnosticValue = string | number | boolean | null;
+
+export interface DiagnosticEvent {
+  level: DiagnosticLevel;
+  area: string;
+  event: string;
+  details?: Record<string, DiagnosticValue>;
+}
+
+export interface DiagnosticEntry extends DiagnosticEvent {
+  timestamp: string;
+  platform: "mobile" | "desktop";
+}
+
+export type DiagnosticReporter = (event: DiagnosticEvent) => void;
+
 export type ChatRole = "user" | "assistant";
 
 export type SupportedImageMimeType = "image/png" | "image/jpeg" | "image/webp" | "image/heic" | "image/heif";

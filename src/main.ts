@@ -5,6 +5,7 @@ import { AgentService } from "./services/agentService";
 import { AuditService } from "./services/auditService";
 import { ArchiveService } from "./services/archiveService";
 import { CommandCenterService } from "./services/commandCenterService";
+import { DiagnosticService } from "./services/diagnosticService";
 import { GeminiClient } from "./services/geminiClient";
 import { IndexService } from "./services/indexService";
 import { IntegrationService } from "./services/integrationService";
@@ -15,9 +16,10 @@ import { ToolRegistry } from "./services/toolRegistry";
 import { AttachmentStore } from "./storage/attachmentStore";
 import { SessionStore } from "./storage/sessionStore";
 import { VectorStore } from "./storage/vectorStore";
-import type { AgentCallbacks, ChatMessage, ChatSession, CommandCenterSnapshot, CustomCommand, ImageAttachmentInput, IntegrationStatus, MemoryEntry, PersistedData, ToolAuditEntry, VaultPilotSettings } from "./types";
+import type { AgentCallbacks, ChatMessage, ChatSession, CommandCenterSnapshot, CustomCommand, DiagnosticEntry, ImageAttachmentInput, IntegrationStatus, MemoryEntry, PersistedData, ToolAuditEntry, VaultPilotSettings } from "./types";
 import { createId } from "./utils/id";
 import { imageLimits, validateImageCandidate } from "./utils/imageAttachments";
+import { diagnosticErrorKind } from "./utils/diagnostics";
 import { CHAT_VIEW_TYPE, COMMAND_CENTER_VIEW_TYPE, VaultPilotChatView, type ChatViewHost } from "./ui/chatView";
 import { VaultPilotSettingTab, type SettingsHost } from "./ui/settingsTab";
 import { VaultPilotPriorityBasesView } from "./ui/priorityBasesView";
@@ -37,6 +39,7 @@ export default class VaultPilotPlugin extends Plugin implements ChatViewHost, Se
   private agent!: AgentService;
   private archive!: ArchiveService;
   private commandCenter!: CommandCenterService;
+  private diagnostics!: DiagnosticService;
   private activeController: AbortController | null = null;
   private statusBarEl: HTMLElement | null = null;
   private saveHandle: number | null = null;
@@ -56,6 +59,14 @@ export default class VaultPilotPlugin extends Plugin implements ChatViewHost, Se
     }
     this.config.apiKeySecretId = secretId;
     this.config.apiKey = this.app.secretStorage.getSecret(secretId) ?? "";
+    this.diagnostics = new DiagnosticService(this.app, this.manifest.id);
+    await this.diagnostics.initialize();
+    this.diagnostics.record({
+      level: "info",
+      area: "plugin",
+      event: "startup",
+      details: { version: this.manifest.version, model: this.config.model }
+    });
     this.vaultId = stored?.vaultId?.trim() || createId("vault");
     this.sessions = new SessionStore(stored?.sessions, stored?.activeSessionId, () => this.scheduleSave());
     startupStage = "opening local vector storage";
@@ -69,9 +80,15 @@ export default class VaultPilotPlugin extends Plugin implements ChatViewHost, Se
             retryBaseDelayMs: 650,
             serializeRequests: true,
             thinkingLevel: "low",
-            maxOutputTokens: 8192
+            maxOutputTokens: 8192,
+            diagnostics: (event) => this.diagnostics.record(event)
           }
-        : { streaming: true, maxRetries: 1, retryBaseDelayMs: 900 }
+        : {
+            streaming: true,
+            maxRetries: 1,
+            retryBaseDelayMs: 900,
+            diagnostics: (event) => this.diagnostics.record(event)
+          }
     );
     const vaultIdentifier = `${this.app.vault.getName()}:${this.vaultId}`;
     this.vectors = new VectorStore(vaultIdentifier);
@@ -95,7 +112,10 @@ export default class VaultPilotPlugin extends Plugin implements ChatViewHost, Se
         (id) => this.attachments.get(id),
         this.config.maxImageRequestMb * 1024 * 1024
       ),
-      { deferBackgroundMemoryMs: Platform.isMobile ? 1500 : 0 }
+      {
+        deferBackgroundMemoryMs: Platform.isMobile ? 1500 : 0,
+        diagnostics: (event) => this.diagnostics.record(event)
+      }
     );
     this.archive = new ArchiveService(this.app, () => this.config, (id) => this.attachments.get(id));
     this.commandCenter = new CommandCenterService(this.app, () => this.config);
@@ -122,6 +142,7 @@ export default class VaultPilotPlugin extends Plugin implements ChatViewHost, Se
       void this.initializeAfterLayout();
     });
     } catch (error) {
+      this.diagnostics?.record({ level: "error", area: "plugin", event: "startup_failed", details: { errorKind: diagnosticErrorKind(error), stage: startupStage } });
       console.error(`VaultPilot OS startup failed during ${startupStage}`, error);
       new Notice(`VaultPilot OS startup failed during ${startupStage}: ${errorMessage(error)}`, 30_000);
       throw error;
@@ -134,6 +155,7 @@ export default class VaultPilotPlugin extends Plugin implements ChatViewHost, Se
     void this.persistNow();
     this.indexer?.dispose();
     this.attachments?.close();
+    void this.diagnostics?.flush();
     this.app.workspace.detachLeavesOfType(CHAT_VIEW_TYPE);
     this.app.workspace.detachLeavesOfType(COMMAND_CENTER_VIEW_TYPE);
   }
@@ -184,6 +206,22 @@ export default class VaultPilotPlugin extends Plugin implements ChatViewHost, Se
 
   getToolAuditEntries(): ToolAuditEntry[] {
     return this.audit.entries(40);
+  }
+
+  getDiagnosticEntries(): DiagnosticEntry[] {
+    return this.diagnostics.latest(50);
+  }
+
+  getDiagnosticsPath(): string {
+    return this.diagnostics.getPath();
+  }
+
+  async clearDiagnostics(): Promise<void> {
+    await this.diagnostics.clear();
+  }
+
+  async exportDiagnostics(): Promise<string> {
+    return this.diagnostics.exportToVault();
   }
 
   async getMemoryEntries(): Promise<MemoryEntry[]> {
@@ -237,6 +275,12 @@ export default class VaultPilotPlugin extends Plugin implements ChatViewHost, Se
     const sessionId = this.sessions.activeSessionId();
 
     try {
+      this.diagnostics.record({
+        level: "info",
+        area: "chat",
+        event: "request_started",
+        details: { images: imageAttachments.length, model: this.config.model, historySessions: this.config.conversationHistoryLimit }
+      });
       const storedAttachments = await this.attachments.saveMany(imageAttachments);
       this.sessions.addMessage("user", normalizedMessage, storedAttachments);
       assistant = this.sessions.addMessage("assistant", "");
@@ -255,6 +299,7 @@ export default class VaultPilotPlugin extends Plugin implements ChatViewHost, Se
         }
       };
       await this.agent.run(normalizedMessage, wrapped, controller.signal);
+      this.diagnostics.record({ level: "info", area: "chat", event: "request_completed", details: { textChars: response.length } });
       if (!response.trim()) {
         response = "No response was returned.";
         this.sessions.updateMessage(assistantId, response, sessionId);
@@ -266,6 +311,12 @@ export default class VaultPilotPlugin extends Plugin implements ChatViewHost, Se
         throw error;
       }
       const stopped = controller.signal.aborted || (error instanceof DOMException && error.name === "AbortError");
+      this.diagnostics.record({
+        level: stopped ? "info" : "error",
+        area: "chat",
+        event: stopped ? "request_stopped" : "request_failed",
+        details: { errorKind: diagnosticErrorKind(error), textChars: response.length }
+      });
       if (!response.trim()) {
         response = stopped ? "Stopped." : `Error: ${errorMessage(error)}`;
         this.sessions.updateMessage(assistant.id, response, sessionId);
@@ -382,6 +433,13 @@ export default class VaultPilotPlugin extends Plugin implements ChatViewHost, Se
       id: "rebuild-vector-index",
       name: "Rebuild local vector index",
       callback: () => void this.rebuildSearchIndex().then(() => new Notice("VaultPilot OS index rebuilt.")).catch((error) => new Notice(errorMessage(error), 8000))
+    });
+    this.addCommand({
+      id: "export-diagnostics",
+      name: "Export diagnostic log",
+      callback: () => void this.exportDiagnostics()
+        .then((path) => new Notice(`VaultPilot diagnostics exported to ${path}`))
+        .catch((error) => new Notice(errorMessage(error), 8000))
     });
     this.addCommand({
       id: "undo-last-change",

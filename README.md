@@ -13,7 +13,9 @@ There is no VaultPilot subscription, hosted proxy, or middle-man service.
 - Touch-sized controls, safe-area padding, virtual-keyboard-aware composing, camera/photo selection, and optional dictation
 - Desktop/mobile image picker with previews, paste support, and Gemini multimodal analysis
 - Native Gemini function-calling agent loop with configurable step limit
+- Forced text-only final-answer recovery after tool calls, including empty Gemini `STOP` responses
 - Per-category read, network, write, and sync policies with previews, an activity log, and guarded undo
+- Bounded privacy-safe local diagnostics with Settings and Command Palette export controls
 - Hard-coded `.obsidian` forbidden zone beneath every model-accessible file tool
 - Vault search, note read/create/edit, and free DuckDuckGo HTML web search tools
 - IndexedDB vector storage with incremental, batched startup and file-event indexing
@@ -37,7 +39,7 @@ There is no VaultPilot subscription, hosted proxy, or middle-man service.
 
 The install-ready folder contains `manifest.json`, `main.js`, and `styles.css`.
 
-VaultPilot 1.5.1 requires Obsidian 1.11.4 or newer so Gemini credentials can use Obsidian SecretStorage and the current Bases API.
+VaultPilot 1.5.2 requires Obsidian 1.11.4 or newer so Gemini credentials can use Obsidian SecretStorage and the current Bases API.
 
 ### Desktop views
 
@@ -56,7 +58,9 @@ The same package supports iOS and Android; there is no separate reduced feature 
 
 Because Obsidian mobile has no persistent right sidebar, compact chat and the Command Center both open as full-screen workspace tabs while retaining their distinct layouts. On-screen Enter inserts a newline; tap **Send** to submit. A connected hardware keyboard can submit with Ctrl+Enter or Cmd+Enter. The image button opens the native iOS/Android photo or camera chooser. Session cost remains in the chat header because Obsidian mobile has no bottom status bar. Mobile indexing can be disabled independently to save battery while retaining the existing local index. Mobile chat uses Gemini's non-streaming JSON endpoint to avoid empty responses caused by buffered SSE handling in mobile WebViews.
 
-Version 1.5.1 adds automatic exponential-backoff retries for temporary network, timeout, rate-limit, and Gemini service failures. Mobile Gemini traffic is serialized so chat does not compete with indexing or memory extraction, background memory work waits until the answer is complete, and Gemini 3 uses low thinking on mobile to reduce latency. A failed request can be attempted up to three times before an error is shown.
+Version 1.5.2 forces post-tool final turns into Gemini's text-only function-calling mode and retries both unexpected tool calls and empty final responses. It also adds a bounded local diagnostic log containing operational metadata such as timing, status codes, finish reasons, retry counts, token counts, and tool-call counts. Prompts, note contents, response bodies, tool arguments, images, headers, and API keys are not recorded. The log can be reviewed, exported, or cleared from Settings; the Command Palette also includes **VaultPilot OS: Export diagnostic log**.
+
+Version 1.5.1 added automatic exponential-backoff retries for temporary network, timeout, rate-limit, and Gemini service failures. Mobile Gemini traffic is serialized so chat does not compete with indexing or memory extraction, background memory work waits until the answer is complete, and Gemini 3 uses low thinking on mobile to reduce latency. A failed request can be attempted up to three times before an error is shown.
 
 ### Build from source
 
@@ -83,7 +87,7 @@ Google recommends server-side secret storage for conventional browser applicatio
 - **Account requirement:** A user-owned Google Gemini API key is required. VaultPilot has no account system, subscription, payment, advertising, or affiliate program.
 - **Network use:** Prompts, explicitly attached images, selected note context, memory-extraction inputs, and embedding chunks are sent directly to Google Gemini when their corresponding features run. Web-search queries are sent directly to DuckDuckGo. No VaultPilot-operated server exists.
 - **Vault access:** The plugin can read and change Markdown notes through user-requested or automatically approved tools. Model-accessible paths are limited to the current vault, and `.obsidian` is permanently forbidden to those tools.
-- **Telemetry:** VaultPilot contains no analytics, crash reporting, tracking pixels, or client-side telemetry.
+- **Telemetry:** VaultPilot contains no analytics, crash reporting, tracking pixels, or client-side telemetry. Its optional local diagnostic export never leaves the vault unless the user shares it.
 - **Source:** The complete plugin source is available under the MIT License.
 
 ## Security boundary
