@@ -239,6 +239,35 @@ export interface MemoryEntry {
   source: string;
 }
 
+export interface CommandCenterTask {
+  text: string;
+  path: string;
+  line: number;
+  due?: string;
+  overdue: boolean;
+}
+
+export interface CommandCenterProject {
+  name: string;
+  path: string;
+  progress?: number;
+  updatedAt: number;
+}
+
+export interface CommandCenterNote {
+  name: string;
+  path: string;
+  updatedAt: number;
+}
+
+export interface CommandCenterSnapshot {
+  dateLabel: string;
+  tasks: CommandCenterTask[];
+  projects: CommandCenterProject[];
+  recentNotes: CommandCenterNote[];
+  briefing: string[];
+}
+
 export interface AgentCallbacks {
   onText(delta: string): void;
   onToolStart(description: string): void;

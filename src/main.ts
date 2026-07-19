@@ -4,6 +4,7 @@ import { DEFAULT_SETTINGS, mergeSettings } from "./settings/defaults";
 import { AgentService } from "./services/agentService";
 import { AuditService } from "./services/auditService";
 import { ArchiveService } from "./services/archiveService";
+import { CommandCenterService } from "./services/commandCenterService";
 import { GeminiClient } from "./services/geminiClient";
 import { IndexService } from "./services/indexService";
 import { IntegrationService } from "./services/integrationService";
@@ -14,7 +15,7 @@ import { ToolRegistry } from "./services/toolRegistry";
 import { AttachmentStore } from "./storage/attachmentStore";
 import { SessionStore } from "./storage/sessionStore";
 import { VectorStore } from "./storage/vectorStore";
-import type { AgentCallbacks, ChatMessage, ChatSession, CustomCommand, ImageAttachmentInput, IntegrationStatus, MemoryEntry, PersistedData, ToolAuditEntry, VaultPilotSettings } from "./types";
+import type { AgentCallbacks, ChatMessage, ChatSession, CommandCenterSnapshot, CustomCommand, ImageAttachmentInput, IntegrationStatus, MemoryEntry, PersistedData, ToolAuditEntry, VaultPilotSettings } from "./types";
 import { createId } from "./utils/id";
 import { imageLimits, validateImageCandidate } from "./utils/imageAttachments";
 import { CHAT_VIEW_TYPE, VaultPilotChatView, type ChatViewHost } from "./ui/chatView";
@@ -35,6 +36,7 @@ export default class VaultPilotPlugin extends Plugin implements ChatViewHost, Se
   private memory!: MemoryService;
   private agent!: AgentService;
   private archive!: ArchiveService;
+  private commandCenter!: CommandCenterService;
   private activeController: AbortController | null = null;
   private statusBarEl: HTMLElement | null = null;
   private saveHandle: number | null = null;
@@ -86,6 +88,7 @@ export default class VaultPilotPlugin extends Plugin implements ChatViewHost, Se
       )
     );
     this.archive = new ArchiveService(this.app, () => this.config, (id) => this.attachments.get(id));
+    this.commandCenter = new CommandCenterService(this.app, () => this.config);
 
     startupStage = "registering the Obsidian interface";
     this.registerView(CHAT_VIEW_TYPE, (leaf) => new VaultPilotChatView(leaf, this));
@@ -173,6 +176,10 @@ export default class VaultPilotPlugin extends Plugin implements ChatViewHost, Se
 
   async getMemoryEntries(): Promise<MemoryEntry[]> {
     return this.memory.listEntries();
+  }
+
+  async getCommandCenterSnapshot(): Promise<CommandCenterSnapshot> {
+    return this.commandCenter.snapshot();
   }
 
   async forgetMemory(category: MemoryEntry["category"], key: string): Promise<boolean> {
@@ -419,18 +426,22 @@ export default class VaultPilotPlugin extends Plugin implements ChatViewHost, Se
 
   private registerVaultEvents(): void {
     this.registerEvent(this.app.vault.on("create", (file) => {
+      this.commandCenter.invalidate();
       this.search.invalidateGraph();
       if (file instanceof TFile && file.extension.toLocaleLowerCase() === "md") this.indexer.scheduleFile(file);
     }));
     this.registerEvent(this.app.vault.on("modify", (file) => {
+      this.commandCenter.invalidate();
       this.search.invalidateGraph();
       if (file instanceof TFile && file.extension.toLocaleLowerCase() === "md") this.indexer.scheduleFile(file);
     }));
     this.registerEvent(this.app.vault.on("delete", (file) => {
+      this.commandCenter.invalidate();
       this.search.invalidateGraph();
       this.indexer.scheduleFile(file.path);
     }));
     this.registerEvent(this.app.vault.on("rename", (file, oldPath) => {
+      this.commandCenter.invalidate();
       this.search.invalidateGraph();
       this.indexer.scheduleFile(oldPath);
       if (file instanceof TFile && file.extension.toLocaleLowerCase() === "md") this.indexer.scheduleFile(file);
