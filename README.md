@@ -37,7 +37,7 @@ There is no VaultPilot subscription, hosted proxy, or middle-man service.
 
 The install-ready folder contains `manifest.json`, `main.js`, and `styles.css`.
 
-VaultPilot 1.5.0 requires Obsidian 1.11.4 or newer so Gemini credentials can use Obsidian SecretStorage and the current Bases API.
+VaultPilot 1.5.1 requires Obsidian 1.11.4 or newer so Gemini credentials can use Obsidian SecretStorage and the current Bases API.
 
 ### Desktop views
 
@@ -55,6 +55,8 @@ The same package supports iOS and Android; there is no separate reduced feature 
 4. Select the VaultPilot dashboard ribbon action for the advanced Command Center, or run **VaultPilot OS: Open compact chat** for the lightweight chat layout.
 
 Because Obsidian mobile has no persistent right sidebar, compact chat and the Command Center both open as full-screen workspace tabs while retaining their distinct layouts. On-screen Enter inserts a newline; tap **Send** to submit. A connected hardware keyboard can submit with Ctrl+Enter or Cmd+Enter. The image button opens the native iOS/Android photo or camera chooser. Session cost remains in the chat header because Obsidian mobile has no bottom status bar. Mobile indexing can be disabled independently to save battery while retaining the existing local index. Mobile chat uses Gemini's non-streaming JSON endpoint to avoid empty responses caused by buffered SSE handling in mobile WebViews.
+
+Version 1.5.1 adds automatic exponential-backoff retries for temporary network, timeout, rate-limit, and Gemini service failures. Mobile Gemini traffic is serialized so chat does not compete with indexing or memory extraction, background memory work waits until the answer is complete, and Gemini 3 uses low thinking on mobile to reduce latency. A failed request can be attempted up to three times before an error is shown.
 
 ### Build from source
 

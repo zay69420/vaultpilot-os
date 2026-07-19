@@ -19,6 +19,16 @@ export interface GeminiClientOptions {
    * as an SSE ReadableStream, so mobile callers should use generateContent.
    */
   streaming?: boolean;
+  /** Retries after the initial attempt for transient network and API failures. */
+  maxRetries?: number;
+  /** Initial exponential-backoff delay. Set to zero in deterministic tests. */
+  retryBaseDelayMs?: number;
+  /** Serializes Gemini traffic so mobile chat, memory, and indexing do not compete. */
+  serializeRequests?: boolean;
+  /** Gemini 3 thinking level for latency-sensitive clients such as mobile. */
+  thinkingLevel?: "minimal" | "low" | "medium" | "high";
+  /** Optional per-turn output cap for constrained clients. */
+  maxOutputTokens?: number;
 }
 
 interface GenerateOptions {
@@ -34,12 +44,16 @@ interface GeminiChunk {
   candidates?: Array<{
     content?: GeminiContent;
     finishReason?: string;
+    finishMessage?: string;
   }>;
   usageMetadata?: GeminiUsageMetadata;
+  promptFeedback?: { blockReason?: string };
   error?: { message?: string; code?: number; status?: string };
 }
 
 export class GeminiClient {
+  private requestQueueTail: Promise<void> = Promise.resolve();
+
   constructor(
     private readonly getSettings: () => VaultPilotSettings,
     private readonly transport: GeminiTransport,
@@ -97,8 +111,7 @@ export class GeminiClient {
       contents: [{ role: "user", parts: [{ text: options.prompt }] }],
       systemInstruction: { parts: [{ text: options.systemInstruction }] },
       generationConfig: {
-        temperature: 0.1,
-        maxOutputTokens: 2048,
+        ...this.createGenerationConfig(options.model ?? settings.model, settings, 2048, 0.1),
         responseMimeType: "application/json"
       }
     };
@@ -170,7 +183,7 @@ export class GeminiClient {
     if (publicText) options.onText?.(publicText);
     const result = this.turnResult(parts, data.usageMetadata ?? {}, settings);
     if (!hasUsableTurn(result)) {
-      throw new Error("Gemini completed the request but returned neither response text nor a tool call.");
+      throw emptyResponseError(data);
     }
     return result;
   }
@@ -180,10 +193,28 @@ export class GeminiClient {
       contents: options.contents,
       systemInstruction: { parts: [{ text: options.systemInstruction }] },
       ...(options.tools?.length ? { tools: [{ functionDeclarations: options.tools }] } : {}),
-      generationConfig: {
-        temperature: settings.temperature,
-        maxOutputTokens: settings.maxOutputTokens
-      }
+      generationConfig: this.createGenerationConfig(options.model ?? settings.model, settings)
+    };
+  }
+
+  private createGenerationConfig(
+    modelInput: string,
+    settings: VaultPilotSettings,
+    outputLimit = settings.maxOutputTokens,
+    temperature = settings.temperature
+  ): Record<string, unknown> {
+    const model = modelInput.replace(/^models\//, "").trim();
+    const isGemini3 = /^gemini-3(?:[.\-]|$)/i.test(model);
+    const configuredCap = Math.max(256, this.clientOptions.maxOutputTokens ?? outputLimit);
+    const maxOutputTokens = Math.min(outputLimit, configuredCap);
+    return {
+      maxOutputTokens,
+      // Gemini 3.x is optimized for its default sampling parameters. Keeping a
+      // user temperature remains useful for earlier model families.
+      ...(!isGemini3 ? { temperature } : {}),
+      ...(isGemini3 && this.clientOptions.thinkingLevel
+        ? { thinkingConfig: { thinkingLevel: this.clientOptions.thinkingLevel } }
+        : {})
     };
   }
 
@@ -214,30 +245,81 @@ export class GeminiClient {
   }
 
   private async request(modelInput: string, method: string, body: unknown, signal: AbortSignal | undefined): Promise<Response> {
+    return this.withRequestSlot(signal, () => this.requestWithRetries(modelInput, method, body, signal));
+  }
+
+  private async requestWithRetries(modelInput: string, method: string, body: unknown, signal: AbortSignal | undefined): Promise<Response> {
     const settings = this.requireSettings();
     const model = modelInput.replace(/^models\//, "").trim();
     if (!model || /[?#]/.test(model)) throw new Error("The configured Gemini model name is invalid.");
     const url = `${GEMINI_API_ROOT}/models/${encodeURIComponent(model)}:${method}`;
-    let response: Response;
-    try {
-      response = await this.transport(url, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          "x-goog-api-key": settings.apiKey.trim()
-        },
-        body: JSON.stringify(body),
-        signal
-      });
-    } catch (error) {
-      if (signal?.aborted) throw new DOMException("The request was stopped.", "AbortError");
-      throw new Error(`Could not reach the Gemini API: ${errorMessage(error)}`);
-    }
-    if (!response.ok) {
+    const maxRetries = Math.max(0, Math.min(4, Math.round(this.clientOptions.maxRetries ?? 0)));
+    const requestInit: RequestInit = {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "x-goog-api-key": settings.apiKey.trim()
+      },
+      body: JSON.stringify(body),
+      signal
+    };
+
+    for (let attempt = 0; attempt <= maxRetries; attempt += 1) {
+      assertNotAborted(signal);
+      let response: Response;
+      try {
+        response = await this.transport(url, requestInit);
+      } catch (error) {
+        if (signal?.aborted) throw new DOMException("The request was stopped.", "AbortError");
+        if (attempt < maxRetries) {
+          await this.waitBeforeRetry(attempt, undefined, signal);
+          continue;
+        }
+        throw new Error(`Could not reach the Gemini API after ${attempt + 1} ${attempt === 0 ? "attempt" : "attempts"}: ${errorMessage(error)}`);
+      }
+      if (response.ok) return response;
+      if (isRetryableStatus(response.status) && attempt < maxRetries) {
+        await this.waitBeforeRetry(attempt, response.headers.get("Retry-After") ?? undefined, signal);
+        continue;
+      }
       const message = await readApiError(response);
       throw new Error(`Gemini API error (${response.status}): ${message}`);
     }
-    return response;
+    throw new Error("Could not reach the Gemini API after retrying.");
+  }
+
+  private async waitBeforeRetry(attempt: number, retryAfter: string | undefined, signal: AbortSignal | undefined): Promise<void> {
+    const base = Math.max(0, this.clientOptions.retryBaseDelayMs ?? 750);
+    const serverDelay = parseRetryAfter(retryAfter);
+    const exponential = Math.min(8_000, base * (2 ** attempt));
+    const jitter = base > 0 ? Math.floor(Math.random() * Math.min(250, base)) : 0;
+    await abortableDelay(Math.max(serverDelay, exponential + jitter), signal);
+  }
+
+  private async withRequestSlot<T>(signal: AbortSignal | undefined, operation: () => Promise<T>): Promise<T> {
+    if (!this.clientOptions.serializeRequests) return operation();
+
+    const predecessor = this.requestQueueTail;
+    let released = false;
+    let release!: () => void;
+    const slot = new Promise<void>((resolve) => {
+      release = () => {
+        if (released) return;
+        released = true;
+        resolve();
+      };
+    });
+    this.requestQueueTail = predecessor.then(() => slot);
+    let acquired = false;
+    try {
+      await waitForQueue(predecessor, signal);
+      acquired = true;
+      assertNotAborted(signal);
+      return await operation();
+    } finally {
+      if (acquired) release();
+      else void predecessor.then(release);
+    }
   }
 
   private async consumeSse(
@@ -285,6 +367,70 @@ export class GeminiClient {
 
 function hasUsableTurn(result: GeminiTurnResult): boolean {
   return Boolean(result.text.trim() || result.functionCalls.length);
+}
+
+function emptyResponseError(data: GeminiChunk): Error {
+  const candidate = data.candidates?.[0];
+  const reason = candidate?.finishReason?.trim();
+  const detail = candidate?.finishMessage?.trim();
+  const blocked = data.promptFeedback?.blockReason?.trim();
+  if (blocked) return new Error(`Gemini blocked the request before generating a response (${blocked}). Try rephrasing it.`);
+  if (reason === "MAX_TOKENS") {
+    return new Error("Gemini reached its output limit before producing displayable text. Retry once or reduce the request context.");
+  }
+  if (reason === "UNEXPECTED_TOOL_CALL" || reason === "MALFORMED_FUNCTION_CALL" || reason === "MISSING_THOUGHT_SIGNATURE") {
+    return new Error(`Gemini could not complete the tool exchange (${reason}). VaultPilot will retry the next request with a fresh turn.`);
+  }
+  const suffix = [reason, detail].filter(Boolean).join(": ");
+  return new Error(`Gemini completed the request without displayable text${suffix ? ` (${suffix})` : ""}.`);
+}
+
+function isRetryableStatus(status: number): boolean {
+  return status === 408 || status === 425 || status === 429 || status >= 500;
+}
+
+function parseRetryAfter(value: string | undefined): number {
+  if (!value) return 0;
+  const seconds = Number(value);
+  if (Number.isFinite(seconds)) return Math.max(0, Math.min(30_000, seconds * 1000));
+  const date = Date.parse(value);
+  return Number.isFinite(date) ? Math.max(0, Math.min(30_000, date - Date.now())) : 0;
+}
+
+function assertNotAborted(signal: AbortSignal | undefined): void {
+  if (signal?.aborted) throw new DOMException("The request was stopped.", "AbortError");
+}
+
+function abortableDelay(milliseconds: number, signal: AbortSignal | undefined): Promise<void> {
+  if (milliseconds <= 0) {
+    assertNotAborted(signal);
+    return Promise.resolve();
+  }
+  return new Promise<void>((resolve, reject) => {
+    const handle = globalThis.setTimeout(() => finish(resolve), milliseconds);
+    const onAbort = (): void => finish(() => reject(new DOMException("The request was stopped.", "AbortError")));
+    const finish = (action: () => void): void => {
+      globalThis.clearTimeout(handle);
+      signal?.removeEventListener("abort", onAbort);
+      action();
+    };
+    if (signal?.aborted) onAbort();
+    else signal?.addEventListener("abort", onAbort, { once: true });
+  });
+}
+
+function waitForQueue(queue: Promise<void>, signal: AbortSignal | undefined): Promise<void> {
+  if (!signal) return queue;
+  assertNotAborted(signal);
+  return new Promise<void>((resolve, reject) => {
+    const onAbort = (): void => finish(() => reject(new DOMException("The request was stopped.", "AbortError")));
+    const finish = (action: () => void): void => {
+      signal.removeEventListener("abort", onAbort);
+      action();
+    };
+    signal.addEventListener("abort", onAbort, { once: true });
+    void queue.then(() => finish(resolve));
+  });
 }
 
 function stripJsonFence(value: string): string {

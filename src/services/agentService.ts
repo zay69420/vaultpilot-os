@@ -3,25 +3,39 @@ import { GeminiClient } from "./geminiClient";
 import { MemoryService } from "./memoryService";
 import { ToolRegistry } from "./toolRegistry";
 
+export interface AgentServiceOptions {
+  /** Delays non-blocking memory extraction until the interactive response is complete. */
+  deferBackgroundMemoryMs?: number;
+}
+
 export class AgentService {
   constructor(
     private readonly gemini: GeminiClient,
     private readonly memory: MemoryService,
     private readonly tools: ToolRegistry,
     private readonly getSettings: () => VaultPilotSettings,
-    private readonly getConversationContext: () => Promise<GeminiContent[]>
+    private readonly getConversationContext: () => Promise<GeminiContent[]>,
+    private readonly options: AgentServiceOptions = {}
   ) {}
 
   async run(userMessage: string, callbacks: AgentCallbacks, signal?: AbortSignal): Promise<string> {
     const settings = this.getSettings();
     let visibleText = "";
     let contents = await this.getConversationContext();
+    let deferredMemoryIntercept: (() => void) | null = null;
+
+    const complete = (result: string): string => {
+      deferredMemoryIntercept?.();
+      deferredMemoryIntercept = null;
+      return result;
+    };
 
     if (settings.memoryEnabled && settings.memoryInterceptEnabled) {
+      const memoryContents = contents;
       const intercept = async (reportStatus: boolean): Promise<void> => {
         if (reportStatus) callbacks.onMemoryStatus?.("Reviewing long-term memory…");
         try {
-          const updates = await this.memory.intercept(userMessage, contents, callbacks.onUsage, signal);
+          const updates = await this.memory.intercept(userMessage, memoryContents, callbacks.onUsage, signal);
           if (reportStatus && updates > 0) callbacks.onMemoryStatus?.(`Updated ${updates} memory ${updates === 1 ? "entry" : "entries"}.`);
         } catch (error) {
           if (!signal?.aborted) console.warn("VaultPilot OS memory intercept skipped", error);
@@ -30,7 +44,14 @@ export class AgentService {
         }
       };
       if (settings.memoryInterceptMode === "blocking") await intercept(true);
-      else void intercept(false);
+      else if ((this.options.deferBackgroundMemoryMs ?? 0) > 0) {
+        deferredMemoryIntercept = () => {
+          const delay = Math.max(0, this.options.deferBackgroundMemoryMs ?? 0);
+          globalThis.setTimeout(() => {
+            if (!signal?.aborted) void intercept(false);
+          }, delay);
+        };
+      } else void intercept(false);
     }
 
     const memoryContext = await this.memory.retrieve(userMessage);
@@ -60,7 +81,7 @@ export class AgentService {
           callbacks.onText(fallback);
           visibleText += fallback;
         }
-        return visibleText;
+        return complete(visibleText);
       }
 
       const responseParts: GeminiPart[] = [];
@@ -140,12 +161,24 @@ export class AgentService {
       }
     });
     callbacks.onUsage(finalTurn.usage);
+    if (!visibleText.trim() && finalTurn.functionCalls.length > 0) {
+      const recoveryTurn = await this.gemini.generateTurn({
+        contents,
+        systemInstruction: `${systemInstruction}\n\nTools are unavailable for this final turn. Do not emit a function call. Return the best direct text answer you can from the tool results already present.`,
+        signal,
+        onText: (delta) => {
+          visibleText += delta;
+          callbacks.onText(delta);
+        }
+      });
+      callbacks.onUsage(recoveryTurn.usage);
+    }
     if (!visibleText.trim()) {
-      const fallback = "Gemini completed the request without displayable text. Please retry once or choose another Gemini model in settings.";
+      const fallback = "Gemini finished without text after an automatic recovery attempt. Retry once; VaultPilot will preserve this conversation.";
       callbacks.onText(fallback);
       visibleText = fallback;
     }
-    return visibleText;
+    return complete(visibleText);
   }
 }
 

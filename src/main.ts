@@ -62,7 +62,16 @@ export default class VaultPilotPlugin extends Plugin implements ChatViewHost, Se
     this.gemini = new GeminiClient(
       () => this.config,
       obsidianGeminiTransport,
-      { streaming: !Platform.isMobile }
+      Platform.isMobile
+        ? {
+            streaming: false,
+            maxRetries: 2,
+            retryBaseDelayMs: 650,
+            serializeRequests: true,
+            thinkingLevel: "low",
+            maxOutputTokens: 8192
+          }
+        : { streaming: true, maxRetries: 1, retryBaseDelayMs: 900 }
     );
     const vaultIdentifier = `${this.app.vault.getName()}:${this.vaultId}`;
     this.vectors = new VectorStore(vaultIdentifier);
@@ -85,7 +94,8 @@ export default class VaultPilotPlugin extends Plugin implements ChatViewHost, Se
         this.config.conversationHistoryLimit,
         (id) => this.attachments.get(id),
         this.config.maxImageRequestMb * 1024 * 1024
-      )
+      ),
+      { deferBackgroundMemoryMs: Platform.isMobile ? 1500 : 0 }
     );
     this.archive = new ArchiveService(this.app, () => this.config, (id) => this.attachments.get(id));
     this.commandCenter = new CommandCenterService(this.app, () => this.config);

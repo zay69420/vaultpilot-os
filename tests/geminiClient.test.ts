@@ -83,6 +83,125 @@ describe("GeminiClient authentication", () => {
     expect(transport).toHaveBeenCalledTimes(2);
   });
 
+  it("retries transient mobile network failures with bounded backoff", async () => {
+    let attempts = 0;
+    const transport = vi.fn(async () => {
+      attempts += 1;
+      if (attempts < 3) throw new Error(attempts === 1 ? "Request failed. The request timed out." : "The network connection was lost.");
+      return new Response(JSON.stringify({
+        candidates: [{ content: { role: "model", parts: [{ text: "Recovered after retry" }] } }]
+      }), { status: 200, headers: { "Content-Type": "application/json" } });
+    });
+    const client = new GeminiClient(
+      () => ({ ...DEFAULT_SETTINGS, apiKey: "AQ.retry-network-test-key" }),
+      transport,
+      { streaming: false, maxRetries: 2, retryBaseDelayMs: 0 }
+    );
+
+    await expect(client.generateTurn({
+      contents: [{ role: "user", parts: [{ text: "Hello" }] }],
+      systemInstruction: "Be concise."
+    })).resolves.toMatchObject({ text: "Recovered after retry" });
+    expect(transport).toHaveBeenCalledTimes(3);
+  });
+
+  it("retries retryable Gemini status codes but not permanent request errors", async () => {
+    const retryableTransport = vi.fn()
+      .mockResolvedValueOnce(new Response(JSON.stringify({ error: { message: "Temporarily unavailable" } }), { status: 503 }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({ totalTokens: 2 }), { status: 200 }));
+    const retryableClient = new GeminiClient(
+      () => ({ ...DEFAULT_SETTINGS, apiKey: "AQ.retry-status-test-key" }),
+      retryableTransport,
+      { maxRetries: 1, retryBaseDelayMs: 0 }
+    );
+    await expect(retryableClient.testConnection()).resolves.toContain("Connected");
+    expect(retryableTransport).toHaveBeenCalledTimes(2);
+
+    const permanentTransport = vi.fn(async () => new Response(JSON.stringify({ error: { message: "Invalid request" } }), { status: 400 }));
+    const permanentClient = new GeminiClient(
+      () => ({ ...DEFAULT_SETTINGS, apiKey: "AQ.permanent-error-test-key" }),
+      permanentTransport,
+      { maxRetries: 2, retryBaseDelayMs: 0 }
+    );
+    await expect(permanentClient.testConnection()).rejects.toThrow("Gemini API error (400): Invalid request");
+    expect(permanentTransport).toHaveBeenCalledOnce();
+  });
+
+  it("uses low-latency Gemini 3 settings and a mobile output cap", async () => {
+    let requestBody: { generationConfig?: Record<string, unknown> } | undefined;
+    const transport = vi.fn(async (_url: string, init: RequestInit) => {
+      requestBody = JSON.parse(String(init.body)) as { generationConfig?: Record<string, unknown> };
+      return new Response(JSON.stringify({
+        candidates: [{ content: { role: "model", parts: [{ text: "Fast mobile response" }] } }]
+      }), { status: 200 });
+    });
+    const client = new GeminiClient(
+      () => ({ ...DEFAULT_SETTINGS, apiKey: "AQ.mobile-thinking-test-key", model: "gemini-3.5-flash", maxOutputTokens: 16000 }),
+      transport,
+      { streaming: false, thinkingLevel: "low", maxOutputTokens: 8192 }
+    );
+
+    await client.generateTurn({
+      contents: [{ role: "user", parts: [{ text: "Hello" }] }],
+      systemInstruction: "Be concise."
+    });
+    expect(requestBody?.generationConfig).toMatchObject({
+      maxOutputTokens: 8192,
+      thinkingConfig: { thinkingLevel: "low" }
+    });
+    expect(requestBody?.generationConfig).not.toHaveProperty("temperature");
+  });
+
+  it("serializes mobile Gemini traffic so background work cannot compete with chat", async () => {
+    let releaseFirst!: () => void;
+    let signalFirstStarted!: () => void;
+    const firstStarted = new Promise<void>((resolve) => {
+      signalFirstStarted = resolve;
+    });
+    const firstGate = new Promise<void>((resolve) => {
+      releaseFirst = resolve;
+    });
+    let calls = 0;
+    const transport = vi.fn(async () => {
+      calls += 1;
+      if (calls === 1) {
+        signalFirstStarted();
+        await firstGate;
+      }
+      return new Response(JSON.stringify({ totalTokens: calls }), { status: 200 });
+    });
+    const client = new GeminiClient(
+      () => ({ ...DEFAULT_SETTINGS, apiKey: "AQ.serial-mobile-test-key" }),
+      transport,
+      { serializeRequests: true }
+    );
+
+    const first = client.testConnection();
+    await firstStarted;
+    const second = client.testConnection();
+    await Promise.resolve();
+    expect(transport).toHaveBeenCalledOnce();
+    releaseFirst();
+    await Promise.all([first, second]);
+    expect(transport).toHaveBeenCalledTimes(2);
+  });
+
+  it("reports Gemini finish metadata when a response contains no text", async () => {
+    const transport = vi.fn(async () => new Response(JSON.stringify({
+      candidates: [{ content: { role: "model", parts: [{ thought: true, text: "internal" }] }, finishReason: "MAX_TOKENS" }]
+    }), { status: 200 }));
+    const client = new GeminiClient(
+      () => ({ ...DEFAULT_SETTINGS, apiKey: "AQ.empty-finish-test-key" }),
+      transport,
+      { streaming: false }
+    );
+
+    await expect(client.generateTurn({
+      contents: [{ role: "user", parts: [{ text: "Hello" }] }],
+      systemInstruction: "Be concise."
+    })).rejects.toThrow("reached its output limit before producing displayable text");
+  });
+
   it("sends image parts to Gemini as inlineData without rewriting the payload", async () => {
     let requestBody: Record<string, unknown> | undefined;
     const transport = vi.fn(async (_url: string, init: RequestInit) => {
