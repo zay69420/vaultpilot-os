@@ -97,16 +97,83 @@ describe("AgentService resilience", () => {
       contents: GeminiContent[];
       tools?: unknown;
       toolMode?: unknown;
+      maxOutputTokens?: number;
+      thinkingLevel?: string;
     };
     expect(recoveryOptions.tools).toBeUndefined();
     expect(recoveryOptions.toolMode).toBeUndefined();
+    expect(recoveryOptions.maxOutputTokens).toBe(2048);
+    expect(recoveryOptions.thinkingLevel).toBe("minimal");
     expect(recoveryOptions.contents).toHaveLength(1);
     const recoveryPayload = JSON.stringify(recoveryOptions.contents);
-    expect(recoveryPayload).toContain("[vault_search]");
+    expect(recoveryPayload).toContain("Result data from vault search");
+    expect(recoveryPayload).not.toContain("[vault_search]");
     expect(recoveryPayload).toContain('"inlineData":{"mimeType":"image/png","data":"AQID"}');
     expect(recoveryPayload).not.toContain("Gemini finished without text");
     expect(recoveryPayload).not.toContain("functionCall");
     expect(recoveryPayload).not.toContain("functionResponse");
+  });
+
+  it("converts an exact raw write receipt into a concise user-facing confirmation", async () => {
+    const turns: GeminiTurnResult[] = [
+      {
+        content: { role: "model", parts: [{ functionCall: { id: "write-1", name: "edit_note", args: { path: "memory/link_index.md" } } }] },
+        text: "",
+        functionCalls: [{ id: "write-1", name: "edit_note", args: { path: "memory/link_index.md" } }],
+        usage: usage()
+      },
+      {
+        content: { role: "model", parts: [{ functionCall: { id: "write-2", name: "edit_note", args: { path: "memory/link_index.md" } } }] },
+        text: "",
+        functionCalls: [{ id: "write-2", name: "edit_note", args: { path: "memory/link_index.md" } }],
+        usage: usage()
+      },
+      {
+        content: { role: "model", parts: [{ text: '[edit_note] {"ok":true,"operation":"rewrite","path":"memory/link_index.md"}' }] },
+        text: '[edit_note] {"ok":true,"operation":"rewrite","path":"memory/link_index.md"}',
+        functionCalls: [],
+        usage: usage()
+      }
+    ];
+    const gemini = {
+      generateTurn: vi.fn(async (options: { onText?: (delta: string) => void }) => {
+        const turn = turns.shift();
+        if (!turn) throw new Error("Unexpected extra Gemini turn");
+        if (turn.text) options.onText?.(turn.text);
+        return turn;
+      })
+    } as unknown as GeminiClient;
+    const memory = { retrieve: vi.fn(async () => ""), intercept: vi.fn(async () => 0) } as unknown as MemoryService;
+    const tool = {
+      risk: "write",
+      declaration: { name: "edit_note", description: "Edit", parameters: {} },
+      describe: () => "Rewrite note",
+      execute: vi.fn(async () => ({ ok: true, operation: "rewrite", path: "memory/link_index.md" }))
+    };
+    const tools = {
+      declarations: vi.fn(() => [tool.declaration]),
+      get: vi.fn(() => tool),
+      execute: vi.fn(async () => ({ ok: true, operation: "rewrite", path: "memory/link_index.md" })),
+      recordDenied: vi.fn()
+    } as unknown as ToolRegistry;
+    const text: string[] = [];
+    const service = new AgentService(
+      gemini,
+      memory,
+      tools,
+      () => ({ ...DEFAULT_SETTINGS, memoryEnabled: false, maxAgentSteps: 1 }),
+      async () => [
+        { role: "model", parts: [{ text: "x".repeat(50_000) }] },
+        { role: "user", parts: [{ text: "Update my link index" }] }
+      ]
+    );
+
+    await expect(service.run("Update my link index", callbacks(text))).resolves.toBe("Done — I rewrote `memory/link_index.md`.");
+    expect(text.join("")).toBe("Done — I rewrote `memory/link_index.md`.");
+    expect(text.join("")).not.toContain("[edit_note]");
+    const firstContents = (vi.mocked(gemini.generateTurn).mock.calls[0]?.[0] as unknown as { contents: GeminiContent[] }).contents;
+    const firstTextChars = firstContents.reduce((total, content) => total + content.parts.reduce((sum, part) => sum + (part.text?.length ?? 0), 0), 0);
+    expect(firstTextChars).toBeLessThanOrEqual(24_000);
   });
 
   it("defers background memory extraction until after the mobile response", async () => {

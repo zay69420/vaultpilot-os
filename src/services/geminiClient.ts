@@ -43,6 +43,8 @@ interface GenerateOptions {
   signal?: AbortSignal;
   onText?: (delta: string) => void;
   toolMode?: "AUTO" | "NONE";
+  maxOutputTokens?: number;
+  thinkingLevel?: "minimal" | "low" | "medium" | "high";
 }
 
 interface GeminiChunk {
@@ -209,7 +211,13 @@ export class GeminiClient {
       ...(options.toolMode && options.tools?.length
         ? { toolConfig: { functionCallingConfig: { mode: options.toolMode } } }
         : {}),
-      generationConfig: this.createGenerationConfig(options.model ?? settings.model, settings)
+      generationConfig: this.createGenerationConfig(
+        options.model ?? settings.model,
+        settings,
+        options.maxOutputTokens ?? settings.maxOutputTokens,
+        settings.temperature,
+        options.thinkingLevel
+      )
     };
   }
 
@@ -217,7 +225,8 @@ export class GeminiClient {
     modelInput: string,
     settings: VaultPilotSettings,
     outputLimit = settings.maxOutputTokens,
-    temperature = settings.temperature
+    temperature = settings.temperature,
+    thinkingLevel = this.clientOptions.thinkingLevel
   ): Record<string, unknown> {
     const model = modelInput.replace(/^models\//, "").trim();
     const isGemini3 = /^gemini-3(?:[.\-]|$)/i.test(model);
@@ -228,8 +237,8 @@ export class GeminiClient {
       // Gemini 3.x is optimized for its default sampling parameters. Keeping a
       // user temperature remains useful for earlier model families.
       ...(!isGemini3 ? { temperature } : {}),
-      ...(isGemini3 && this.clientOptions.thinkingLevel
-        ? { thinkingConfig: { thinkingLevel: this.clientOptions.thinkingLevel } }
+      ...(isGemini3 && thinkingLevel
+        ? { thinkingConfig: { thinkingLevel } }
         : {})
     };
   }

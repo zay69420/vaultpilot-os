@@ -170,12 +170,18 @@ describe("GeminiClient authentication", () => {
       contents: [{ role: "user", parts: [{ text: "Finish the answer" }] }],
       systemInstruction: "Return the final answer.",
       tools: [{ name: "vault_search", description: "Search the vault", parameters: {} }],
-      toolMode: "NONE"
+      toolMode: "NONE",
+      maxOutputTokens: 2048,
+      thinkingLevel: "minimal"
     });
 
     expect(requestBody).toMatchObject({
       tools: [{ functionDeclarations: [{ name: "vault_search" }] }],
-      toolConfig: { functionCallingConfig: { mode: "NONE" } }
+      toolConfig: { functionCallingConfig: { mode: "NONE" } },
+      generationConfig: {
+        maxOutputTokens: 2048,
+        thinkingConfig: { thinkingLevel: "minimal" }
+      }
     });
   });
 

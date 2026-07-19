@@ -1,7 +1,7 @@
 {
   "id": "vaultpilot-os",
   "name": "VaultPilot OS",
-  "version": "1.5.3",
+  "version": "1.5.4",
   "minAppVersion": "1.11.4",
   "description": "A local-first multimodal Gemini assistant with safe agent tools, productivity integrations, memory, and hybrid search.",
   "author": "zay69420",
