@@ -1,6 +1,6 @@
 {
   "name": "vaultpilot-os",
-  "version": "1.5.2",
+  "version": "1.5.3",
   "description": "A local-first multimodal Gemini assistant for Obsidian vaults.",
   "author": "zay69420",
   "repository": {

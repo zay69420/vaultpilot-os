@@ -39,7 +39,7 @@ There is no VaultPilot subscription, hosted proxy, or middle-man service.
 
 The install-ready folder contains `manifest.json`, `main.js`, and `styles.css`.
 
-VaultPilot 1.5.2 requires Obsidian 1.11.4 or newer so Gemini credentials can use Obsidian SecretStorage and the current Bases API.
+VaultPilot 1.5.3 requires Obsidian 1.11.4 or newer so Gemini credentials can use Obsidian SecretStorage and the current Bases API.
 
 ### Desktop views
 
@@ -57,6 +57,8 @@ The same package supports iOS and Android; there is no separate reduced feature 
 4. Select the VaultPilot dashboard ribbon action for the advanced Command Center, or run **VaultPilot OS: Open compact chat** for the lightweight chat layout.
 
 Because Obsidian mobile has no persistent right sidebar, compact chat and the Command Center both open as full-screen workspace tabs while retaining their distinct layouts. On-screen Enter inserts a newline; tap **Send** to submit. A connected hardware keyboard can submit with Ctrl+Enter or Cmd+Enter. The image button opens the native iOS/Android photo or camera chooser. Session cost remains in the chat header because Obsidian mobile has no bottom status bar. Mobile indexing can be disabled independently to save battery while retaining the existing local index. Mobile chat uses Gemini's non-streaming JSON endpoint to avoid empty responses caused by buffered SSE handling in mobile WebViews.
+
+Version 1.5.3 adds a detached recovery path for Gemini 3.5's strict function-response matching. If the normal post-tool final turn is empty or unexpectedly calls another tool, VaultPilot rebuilds a clean request containing the relevant chat and image context plus bounded tool-result data, with all function-call history and prior error placeholders removed. The recovery request exposes no tools, preventing a malformed exchange from repeating.
 
 Version 1.5.2 forces post-tool final turns into Gemini's text-only function-calling mode and retries both unexpected tool calls and empty final responses. It also adds a bounded local diagnostic log containing operational metadata such as timing, status codes, finish reasons, retry counts, token counts, and tool-call counts. Prompts, note contents, response bodies, tool arguments, images, headers, and API keys are not recorded. The log can be reviewed, exported, or cleared from Settings; the Command Palette also includes **VaultPilot OS: Export diagnostic log**.
 

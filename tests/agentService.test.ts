@@ -4,7 +4,7 @@ import { AgentService } from "../src/services/agentService";
 import type { GeminiClient } from "../src/services/geminiClient";
 import type { MemoryService } from "../src/services/memoryService";
 import type { ToolRegistry } from "../src/services/toolRegistry";
-import type { AgentCallbacks, GeminiTurnResult, TokenUsage } from "../src/types";
+import type { AgentCallbacks, GeminiContent, GeminiTurnResult, TokenUsage } from "../src/types";
 
 const usage = (): TokenUsage => ({ inputTokens: 1, outputTokens: 1, totalTokens: 2, costUsd: 0 });
 
@@ -21,20 +21,29 @@ function callbacks(text: string[]): AgentCallbacks {
 describe("AgentService resilience", () => {
   afterEach(() => vi.useRealTimers());
 
-  it("automatically recovers when a final turn contains no displayable text", async () => {
-    const turns: GeminiTurnResult[] = [
+  it.each([
+    {
+      caseName: "an empty STOP response",
+      failedFinalTurn: new Error("Gemini completed the request without displayable text (STOP).")
+    },
+    {
+      caseName: "an unexpected function call",
+      failedFinalTurn: {
+        content: { role: "model", parts: [{ functionCall: { id: "call-2", name: "vault_search", args: { query: "again" } } }] },
+        text: "",
+        functionCalls: [{ id: "call-2", name: "vault_search", args: { query: "again" } }],
+        usage: usage()
+      } satisfies GeminiTurnResult
+    }
+  ])("automatically recovers from $caseName after tools", async ({ failedFinalTurn }) => {
+    const turns: Array<GeminiTurnResult | Error> = [
       {
         content: { role: "model", parts: [{ functionCall: { id: "call-1", name: "vault_search", args: { query: "test" } } }] },
         text: "",
         functionCalls: [{ id: "call-1", name: "vault_search", args: { query: "test" } }],
         usage: usage()
       },
-      {
-        content: { role: "model", parts: [] },
-        text: "",
-        functionCalls: [],
-        usage: usage()
-      },
+      failedFinalTurn,
       {
         content: { role: "model", parts: [{ text: "Recovered final answer" }] },
         text: "Recovered final answer",
@@ -46,6 +55,7 @@ describe("AgentService resilience", () => {
       generateTurn: vi.fn(async (options: { onText?: (delta: string) => void }) => {
         const turn = turns.shift();
         if (!turn) throw new Error("Unexpected extra Gemini turn");
+        if (turn instanceof Error) throw turn;
         if (turn.text) options.onText?.(turn.text);
         return turn;
       })
@@ -72,14 +82,31 @@ describe("AgentService resilience", () => {
       memory,
       tools,
       () => ({ ...DEFAULT_SETTINGS, memoryEnabled: false, maxAgentSteps: 1 }),
-      async () => [{ role: "user", parts: [{ text: "Find it" }] }]
+      async () => [
+        { role: "user", parts: [{ inlineData: { mimeType: "image/png", data: "AQID" } }, { text: "Inspect this image" }] },
+        { role: "model", parts: [{ text: "Gemini finished without text after an automatic recovery attempt." }] },
+        { role: "user", parts: [{ text: "Find it" }] }
+      ]
     );
 
     await expect(service.run("Find it", callbacks(text))).resolves.toBe("Recovered final answer");
     expect(text.join("")).toBe("Recovered final answer");
     expect(gemini.generateTurn).toHaveBeenCalledTimes(3);
     expect(vi.mocked(gemini.generateTurn).mock.calls[1]?.[0]).toMatchObject({ toolMode: "NONE" });
-    expect(vi.mocked(gemini.generateTurn).mock.calls[2]?.[0]).toMatchObject({ toolMode: "NONE" });
+    const recoveryOptions = vi.mocked(gemini.generateTurn).mock.calls[2]?.[0] as unknown as {
+      contents: GeminiContent[];
+      tools?: unknown;
+      toolMode?: unknown;
+    };
+    expect(recoveryOptions.tools).toBeUndefined();
+    expect(recoveryOptions.toolMode).toBeUndefined();
+    expect(recoveryOptions.contents).toHaveLength(1);
+    const recoveryPayload = JSON.stringify(recoveryOptions.contents);
+    expect(recoveryPayload).toContain("[vault_search]");
+    expect(recoveryPayload).toContain('"inlineData":{"mimeType":"image/png","data":"AQID"}');
+    expect(recoveryPayload).not.toContain("Gemini finished without text");
+    expect(recoveryPayload).not.toContain("functionCall");
+    expect(recoveryPayload).not.toContain("functionResponse");
   });
 
   it("defers background memory extraction until after the mobile response", async () => {
