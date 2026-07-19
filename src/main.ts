@@ -18,7 +18,7 @@ import { VectorStore } from "./storage/vectorStore";
 import type { AgentCallbacks, ChatMessage, ChatSession, CommandCenterSnapshot, CustomCommand, ImageAttachmentInput, IntegrationStatus, MemoryEntry, PersistedData, ToolAuditEntry, VaultPilotSettings } from "./types";
 import { createId } from "./utils/id";
 import { imageLimits, validateImageCandidate } from "./utils/imageAttachments";
-import { CHAT_VIEW_TYPE, VaultPilotChatView, type ChatViewHost } from "./ui/chatView";
+import { CHAT_VIEW_TYPE, COMMAND_CENTER_VIEW_TYPE, VaultPilotChatView, type ChatViewHost } from "./ui/chatView";
 import { VaultPilotSettingTab, type SettingsHost } from "./ui/settingsTab";
 import { VaultPilotPriorityBasesView } from "./ui/priorityBasesView";
 
@@ -91,9 +91,10 @@ export default class VaultPilotPlugin extends Plugin implements ChatViewHost, Se
     this.commandCenter = new CommandCenterService(this.app, () => this.config);
 
     startupStage = "registering the Obsidian interface";
-    this.registerView(CHAT_VIEW_TYPE, (leaf) => new VaultPilotChatView(leaf, this));
+    this.registerView(CHAT_VIEW_TYPE, (leaf) => new VaultPilotChatView(leaf, this, "compact"));
+    this.registerView(COMMAND_CENTER_VIEW_TYPE, (leaf) => new VaultPilotChatView(leaf, this, "command-center"));
     if (this.config.integrations.bases) this.registerPriorityBasesView();
-    this.addRibbonIcon("bot", "Open VaultPilot OS", () => void this.activateChat());
+    this.addRibbonIcon("layout-dashboard", "Open VaultPilot Command Center", () => void this.activateCommandCenter());
     if (!Platform.isMobile) {
       this.statusBarEl = this.addStatusBarItem();
       this.statusBarEl.addClass("vaultpilot-statusbar");
@@ -124,6 +125,7 @@ export default class VaultPilotPlugin extends Plugin implements ChatViewHost, Se
     this.indexer?.dispose();
     this.attachments?.close();
     this.app.workspace.detachLeavesOfType(CHAT_VIEW_TYPE);
+    this.app.workspace.detachLeavesOfType(COMMAND_CENTER_VIEW_TYPE);
   }
 
   getSettings(): VaultPilotSettings {
@@ -340,8 +342,13 @@ export default class VaultPilotPlugin extends Plugin implements ChatViewHost, Se
   private registerCoreCommands(): void {
     this.addCommand({
       id: "open-chat",
-      name: "Open chat",
+      name: "Open compact chat",
       callback: () => void this.activateChat()
+    });
+    this.addCommand({
+      id: "open-command-center",
+      name: "Open Command Center",
+      callback: () => void this.activateCommandCenter()
     });
     this.addCommand({
       id: "open-settings",
@@ -383,12 +390,12 @@ export default class VaultPilotPlugin extends Plugin implements ChatViewHost, Se
     this.addCommand({
       id: "create-daily-briefing",
       name: "Create daily briefing",
-      callback: () => void this.activateChat().then((view) => view.submitExternal("Create a concise daily briefing from my open tasks, active projects, and relevant recent vault context, then write it to today's daily note."))
+      callback: () => void this.activateCommandCenter().then((view) => view.submitExternal("Create a concise daily briefing from my open tasks, active projects, and relevant recent vault context, then write it to today's daily note."))
     });
     this.addCommand({
       id: "plan-my-day",
       name: "Plan my day",
-      callback: () => void this.activateChat().then((view) => view.submitExternal("Review my open and overdue tasks and relevant project notes. Produce a realistic prioritized plan for today with time blocks, dependencies, and a short fallback plan."))
+      callback: () => void this.activateCommandCenter().then((view) => view.submitExternal("Review my open and overdue tasks and relevant project notes. Produce a realistic prioritized plan for today with time blocks, dependencies, and a short fallback plan."))
     });
   }
 
@@ -465,9 +472,25 @@ export default class VaultPilotPlugin extends Plugin implements ChatViewHost, Se
     return view;
   }
 
+  private async activateCommandCenter(): Promise<VaultPilotChatView> {
+    let leaf = this.app.workspace.getLeavesOfType(COMMAND_CENTER_VIEW_TYPE)[0];
+    if (!leaf) {
+      leaf = this.app.workspace.getLeaf("tab");
+      await leaf.setViewState({ type: COMMAND_CENTER_VIEW_TYPE, active: true });
+    }
+    await this.app.workspace.revealLeaf(leaf);
+    this.app.workspace.setActiveLeaf(leaf, { focus: false });
+    const view = leaf.view;
+    if (!(view instanceof VaultPilotChatView)) throw new Error("Could not open the VaultPilot Command Center.");
+    view.refresh();
+    return view;
+  }
+
   private refreshViews(): void {
-    for (const leaf of this.app.workspace.getLeavesOfType(CHAT_VIEW_TYPE)) {
-      if (leaf.view instanceof VaultPilotChatView) leaf.view.refresh();
+    for (const viewType of [CHAT_VIEW_TYPE, COMMAND_CENTER_VIEW_TYPE]) {
+      for (const leaf of this.app.workspace.getLeavesOfType(viewType)) {
+        if (leaf.view instanceof VaultPilotChatView) leaf.view.refresh();
+      }
     }
   }
 

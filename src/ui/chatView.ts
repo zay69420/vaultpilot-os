@@ -10,8 +10,10 @@ import {
   validateImageCandidate
 } from "../utils/imageAttachments";
 import { composerEnterKeyHint, shouldSubmitComposerKey } from "../utils/mobile";
+import { initialTabForViewMode, type CommandCenterTab, type VaultPilotViewMode } from "../utils/viewMode";
 
 export const CHAT_VIEW_TYPE = "vaultpilot-os-chat";
+export const COMMAND_CENTER_VIEW_TYPE = "vaultpilot-os-command-center";
 
 export interface ChatViewHost {
   getSettings(): VaultPilotSettings;
@@ -33,8 +35,6 @@ interface PendingImageAttachment {
   previewUrl: string;
 }
 
-type CommandCenterTab = "today" | "chat" | "search" | "memory";
-
 export class VaultPilotChatView extends ItemView {
   private messagesEl: HTMLElement | null = null;
   private usageEl: HTMLElement | null = null;
@@ -45,26 +45,31 @@ export class VaultPilotChatView extends ItemView {
   private attachmentPreviewEl: HTMLElement | null = null;
   private sendButton: HTMLButtonElement | null = null;
   private navigationEl: HTMLElement | null = null;
-  private activeTab: CommandCenterTab = "today";
+  private activeTab: CommandCenterTab;
   private pendingImages: PendingImageAttachment[] = [];
   private messagePreviewUrls = new Set<string>();
   private renderGeneration = 0;
   private pendingApprovals = new Set<(allowed: boolean) => void>();
 
-  constructor(leaf: WorkspaceLeaf, private readonly host: ChatViewHost) {
+  constructor(
+    leaf: WorkspaceLeaf,
+    private readonly host: ChatViewHost,
+    private readonly mode: VaultPilotViewMode = "compact"
+  ) {
     super(leaf);
+    this.activeTab = initialTabForViewMode(mode);
   }
 
   getViewType(): string {
-    return CHAT_VIEW_TYPE;
+    return this.mode === "command-center" ? COMMAND_CENTER_VIEW_TYPE : CHAT_VIEW_TYPE;
   }
 
   getDisplayText(): string {
-    return "VaultPilot OS";
+    return this.mode === "command-center" ? "VaultPilot Command Center" : "VaultPilot Chat";
   }
 
   getIcon(): string {
-    return "bot";
+    return this.mode === "command-center" ? "layout-dashboard" : "bot";
   }
 
   async onOpen(): Promise<void> {
@@ -103,6 +108,8 @@ export class VaultPilotChatView extends ItemView {
     const container = this.containerEl.children[1] as HTMLElement;
     container.empty();
     container.addClass("vaultpilot-view");
+    container.toggleClass("vaultpilot-compact", this.mode === "compact");
+    container.toggleClass("vaultpilot-command-center", this.mode === "command-center");
     container.toggleClass("vaultpilot-mobile", Platform.isMobile);
     const settings = this.host.getSettings();
     container.toggleClass("vaultpilot-reduce-motion", settings.reduceMotion);
@@ -187,8 +194,12 @@ export class VaultPilotChatView extends ItemView {
       else void this.submit();
     });
 
-    this.navigationEl = container.createDiv({ cls: "vaultpilot-navigation", attr: { role: "tablist", "aria-label": "VaultPilot sections" } });
-    this.renderNavigation();
+    if (this.mode === "command-center") {
+      this.navigationEl = container.createDiv({ cls: "vaultpilot-navigation", attr: { role: "tablist", "aria-label": "VaultPilot sections" } });
+      this.renderNavigation();
+    } else {
+      this.navigationEl = null;
+    }
 
     this.renderMessages();
     this.renderUsage();
@@ -202,15 +213,15 @@ export class VaultPilotChatView extends ItemView {
     const generation = this.renderGeneration;
     this.releaseMessagePreviews();
     this.messagesEl.empty();
-    if (this.activeTab === "today") {
+    if (this.mode === "command-center" && this.activeTab === "today") {
       this.renderCommandCenter(generation);
       return;
     }
-    if (this.activeTab === "search") {
+    if (this.mode === "command-center" && this.activeTab === "search") {
       this.renderSearchCenter();
       return;
     }
-    if (this.activeTab === "memory") {
+    if (this.mode === "command-center" && this.activeTab === "memory") {
       this.renderMemoryCenter(generation);
       return;
     }
@@ -239,7 +250,7 @@ export class VaultPilotChatView extends ItemView {
   }
 
   private renderNavigation(): void {
-    if (!this.navigationEl) return;
+    if (this.mode !== "command-center" || !this.navigationEl) return;
     this.navigationEl.empty();
     const tabs: Array<{ id: CommandCenterTab; label: string; icon: string }> = [
       { id: "today", label: "Today", icon: "house" },

@@ -6,7 +6,7 @@ There is no VaultPilot subscription, hosted proxy, or middle-man service.
 
 ## Highlights
 
-- Native desktop sidebar and full-tab mobile `ItemView` chat
+- Dual native views: compact desktop right-sidebar chat and a full workspace Command Center
 - Responsive Command Center with Today, Chat, Search, and Memory workspaces
 - Vault-derived priority tasks, active project progress, recent notes, and daily briefing cards
 - Mobile-safe Gemini networking through Obsidian's native request bridge, using buffered JSON responses on iOS and Android instead of SSE
@@ -37,7 +37,13 @@ There is no VaultPilot subscription, hosted proxy, or middle-man service.
 
 The install-ready folder contains `manifest.json`, `main.js`, and `styles.css`.
 
-VaultPilot 1.4.0 requires Obsidian 1.11.4 or newer so Gemini credentials can use Obsidian SecretStorage and the current Bases API.
+VaultPilot 1.5.0 requires Obsidian 1.11.4 or newer so Gemini credentials can use Obsidian SecretStorage and the current Bases API.
+
+### Desktop views
+
+- Select the VaultPilot dashboard icon in Obsidian's left ribbon to open the full Command Center as a workspace tab.
+- Run **VaultPilot OS: Open compact chat** from the Command Palette to open or reveal the lightweight right-sidebar chat.
+- Both views share the same active conversation, memory, attachments, usage totals, tool approvals, and settings.
 
 ### Obsidian mobile
 
@@ -46,9 +52,9 @@ The same package supports iOS and Android; there is no separate reduced feature 
 1. Put the `vaultpilot-os` folder in the vault's `.obsidian/plugins/` directory, or let your vault-sync method copy the already installed desktop plugin folder to the mobile device.
 2. In Obsidian mobile, open **Settings > Community plugins** and enable **VaultPilot OS**.
 3. Open **Settings > VaultPilot OS**, add the Gemini key on that device if it was not synced, and use **Test connection**.
-4. Open the robot ribbon action or run **VaultPilot OS: Open chat**. Mobile opens chat as a full workspace tab instead of a narrow sidebar.
+4. Select the VaultPilot dashboard ribbon action for the advanced Command Center, or run **VaultPilot OS: Open compact chat** for the lightweight chat layout.
 
-On-screen Enter inserts a newline on mobile; tap **Send** to submit. A connected hardware keyboard can submit with Ctrl+Enter or Cmd+Enter. The image button opens the native iOS/Android photo or camera chooser. Session cost remains in the chat header because Obsidian mobile has no bottom status bar. Mobile indexing can be disabled independently to save battery while retaining the existing local index. Mobile chat uses Gemini's non-streaming JSON endpoint to avoid empty responses caused by buffered SSE handling in mobile WebViews. Version 1.4.0 adds a touch-friendly bottom navigation bar and single-column Command Center cards on phones.
+Because Obsidian mobile has no persistent right sidebar, compact chat and the Command Center both open as full-screen workspace tabs while retaining their distinct layouts. On-screen Enter inserts a newline; tap **Send** to submit. A connected hardware keyboard can submit with Ctrl+Enter or Cmd+Enter. The image button opens the native iOS/Android photo or camera chooser. Session cost remains in the chat header because Obsidian mobile has no bottom status bar. Mobile indexing can be disabled independently to save battery while retaining the existing local index. Mobile chat uses Gemini's non-streaming JSON endpoint to avoid empty responses caused by buffered SSE handling in mobile WebViews.
 
 ### Build from source
 
